@@ -45,7 +45,7 @@ fn table_error(err: ResourceTableError) -> CapabilityError {
     }
 }
 
-fn require_llm_settings<'a>(config: &'a HostConfig) -> Result<&'a LlmSettings, CapabilityError> {
+fn require_llm_settings(config: &HostConfig) -> Result<&LlmSettings, CapabilityError> {
     config.llm.as_ref().ok_or_else(|| {
         capability_error(
             CapabilityErrorCode::Unavailable,
@@ -640,7 +640,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
 }
 
 impl bindings::osagent::fs::fs::HostDirHandle for HostState {
-    fn close(&mut self, handle: Resource<DirHandle>) -> () {
+    fn close(&mut self, handle: Resource<DirHandle>) {
         let _ = delete_dir(self, handle);
     }
 
@@ -712,7 +712,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
             .map_err(|err| io_error("fs.file.flush", err))
     }
 
-    fn close(&mut self, handle: Resource<FileHandle>) -> () {
+    fn close(&mut self, handle: Resource<FileHandle>) {
         let _ = delete_file(self, handle);
     }
 
@@ -865,7 +865,7 @@ impl bindings::osagent::proc::proc::HostProcess for HostState {
         ))
     }
 
-    fn close(&mut self, handle: Resource<ProcHandle>) -> () {
+    fn close(&mut self, handle: Resource<ProcHandle>) {
         let _ = delete_process(self, handle);
     }
 
@@ -888,7 +888,7 @@ impl bindings::osagent::browser::browser::Host for HostState {
 }
 
 impl bindings::osagent::browser::browser::HostSession for HostState {
-    fn close(&mut self, _rep: Resource<bindings::osagent::browser::browser::Session>) -> () {}
+    fn close(&mut self, _rep: Resource<bindings::osagent::browser::browser::Session>) {}
 
     fn drop(
         &mut self,
