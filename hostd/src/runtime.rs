@@ -161,3 +161,44 @@ fn build_action_observation(reports: &[ActionReport]) -> Result<String> {
     let payload = json!({ "actions": reports });
     serde_json::to_string(&payload).context("failed to serialize action observation")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(capability: &str, success: bool) -> ActionReport {
+        ActionReport {
+            capability: capability.to_string(),
+            success,
+            output: json!({ "ok": success }),
+            error: (!success).then(|| "boom".to_string()),
+        }
+    }
+
+    #[test]
+    fn an_observation_must_be_json_and_is_normalised() {
+        assert!(validate_json("not json").is_err());
+        assert_eq!(validate_json("{ \"a\" : 1 }").unwrap(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn a_summary_counts_actions_and_failures() {
+        assert_eq!(summarize_reports(&[]), "planner returned no actions");
+        assert_eq!(
+            summarize_reports(&[report("fs.list_dir", true), report("proc.spawn", false)]),
+            "executed 2 action(s) with 1 failure(s)"
+        );
+    }
+
+    #[test]
+    fn the_next_observation_carries_every_report() {
+        let data =
+            build_action_observation(&[report("fs.list_dir", true), report("proc.spawn", false)])
+                .unwrap();
+        let value: Value = serde_json::from_str(&data).unwrap();
+        let actions = value["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[1]["capability"], "proc.spawn");
+        assert_eq!(actions[1]["error"], "boom");
+    }
+}

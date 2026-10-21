@@ -157,3 +157,119 @@ impl BrowserFileSettings {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(config: &Path) -> StepArgs {
+        StepArgs {
+            component: PathBuf::from("agent.wasm"),
+            config: config.to_path_buf(),
+            workspace: None,
+            task: "t".into(),
+            observation: "{}".into(),
+            step: 0,
+            allow_proc: Vec::new(),
+        }
+    }
+
+    fn write(name: &str, body: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "hostd-config-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("hostd.toml");
+        fs::write(&path, body).expect("write config");
+        path
+    }
+
+    #[test]
+    fn a_missing_config_file_gives_safe_defaults() {
+        let cfg = HostConfig::from_step_args(&args(Path::new("/nonexistent/hostd.toml"))).unwrap();
+        assert!(cfg.allowed_proc_commands.is_empty(), "no command may run");
+        assert!(cfg.llm.is_none() && cfg.browser.is_none());
+        assert_eq!(
+            cfg.workspace_root.as_std_path(),
+            fs::canonicalize(".").unwrap()
+        );
+    }
+
+    #[test]
+    fn the_command_line_overrides_and_extends_the_file() {
+        let dir = std::env::temp_dir();
+        let path = write(
+            "merge",
+            "workspace_root = \"/does/not/matter\"\nallow_proc = [\"ls\", \"echo\"]\n",
+        );
+        let mut a = args(&path);
+        a.workspace = Some(dir.clone());
+        a.allow_proc = vec!["echo".into(), "cat".into()];
+        let cfg = HostConfig::from_step_args(&a).unwrap();
+        assert_eq!(
+            cfg.workspace_root.as_std_path(),
+            fs::canonicalize(&dir).unwrap()
+        );
+        assert_eq!(
+            cfg.allowed_proc_commands,
+            ["cat", "echo", "ls"],
+            "merged, sorted, deduplicated"
+        );
+    }
+
+    #[test]
+    fn an_llm_section_without_a_key_or_a_model_is_off() {
+        for body in [
+            "[llm]\nmodel = \"m\"\n",
+            "[llm]\napi_key = \"k\"\n",
+            "[llm]\napi_key = \" \"\nmodel = \"m\"\n",
+        ] {
+            let cfg = HostConfig::from_step_args(&args(&write("llmoff", body))).unwrap();
+            assert!(cfg.llm.is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn the_llm_endpoint_defaults_to_openai() {
+        let cfg = HostConfig::from_step_args(&args(&write(
+            "llmdefault",
+            "[llm]\napi_key = \"k\"\nmodel = \"m\"\n",
+        )))
+        .unwrap();
+        assert_eq!(cfg.llm.unwrap().api_base, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn a_browser_section_needs_a_webdriver_url() {
+        let on = HostConfig::from_step_args(&args(&write(
+            "browseron",
+            "[browser]\nwebdriver_url = \"http://127.0.0.1:9515\"\n",
+        )))
+        .unwrap();
+        assert_eq!(on.browser.unwrap().webdriver_url, "http://127.0.0.1:9515");
+        let off = HostConfig::from_step_args(&args(&write(
+            "browseroff",
+            "[browser]\ndefault_profile = \"p\"\n",
+        )))
+        .unwrap();
+        assert!(off.browser.is_none());
+    }
+
+    #[test]
+    fn a_malformed_config_is_an_error() {
+        let path = write("bad", "allow_proc = \"ls\"\n");
+        assert!(HostConfig::from_step_args(&args(&path)).is_err());
+    }
+
+    #[test]
+    fn an_empty_allowlist_allows_nothing() {
+        let cfg = HostConfig::from_step_args(&args(Path::new("/nonexistent/hostd.toml"))).unwrap();
+        assert!(!cfg.is_proc_allowed("ls"));
+        assert!(!cfg.is_proc_allowed(""));
+    }
+}

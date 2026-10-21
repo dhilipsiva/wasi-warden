@@ -62,10 +62,14 @@ fn plan_with_llm(
         frequency_penalty: None,
     };
     let completion = llm::complete(&messages, &options).map_err(cap_err("llm.complete"))?;
-    let envelope: PlanEnvelope = serde_json::from_str(&completion.content).map_err(|err| {
+    plan_from_content(&completion.content)
+}
+
+/// The step response the model's reply `content` describes.
+fn plan_from_content(content: &str) -> Result<StepResponse, AgentErr> {
+    let envelope: PlanEnvelope = serde_json::from_str(content).map_err(|err| {
         AgentErr::fatal(format!(
-            "failed to parse LLM response: {err}; content: {}",
-            completion.content
+            "failed to parse LLM response: {err}; content: {content}"
         ))
     })?;
 
@@ -181,4 +185,76 @@ enum PlanStatus {
 struct LlmAction {
     capability: String,
     input: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(content: &str) -> Result<StepResponse, String> {
+        plan_from_content(content).map_err(|e| e.message)
+    }
+
+    const CONTINUE: &str = r#"{"status":"continue","thought":"look","actions":[{"capability":"fs.list_dir","input":{"path":"."}}]}"#;
+
+    #[test]
+    fn a_continue_plan_carries_its_actions() {
+        match plan(CONTINUE).unwrap() {
+            StepResponse::Continue(p) => {
+                assert_eq!(p.thought, "look");
+                assert_eq!(p.actions.len(), 1);
+                assert_eq!(p.actions[0].capability, "fs.list_dir");
+                assert_eq!(p.actions[0].input, r#"{"path":"."}"#);
+            }
+            StepResponse::Complete(_) => panic!("expected a continue plan"),
+        }
+    }
+
+    #[test]
+    fn a_continue_plan_needs_at_least_one_action() {
+        assert!(plan(r#"{"status":"continue","thought":"t"}"#).is_err());
+        assert!(plan(r#"{"status":"continue","thought":"t","actions":[]}"#).is_err());
+    }
+
+    #[test]
+    fn a_complete_plan_takes_its_reason_then_its_thought() {
+        let done = |content| match plan(content).unwrap() {
+            StepResponse::Complete(c) => (c.reason, c.outcome),
+            StepResponse::Continue(_) => panic!("expected completion"),
+        };
+        assert_eq!(
+            done(r#"{"status":"complete","reason":"r","thought":"t","result":{"x":1}}"#),
+            ("r".to_string(), r#"{"x":1}"#.to_string())
+        );
+        assert_eq!(
+            done(r#"{"status":"complete","thought":"t"}"#),
+            ("t".to_string(), "null".to_string())
+        );
+    }
+
+    #[test]
+    fn prose_is_not_a_plan() {
+        let err = plan("I will list the files now.").unwrap_err();
+        assert!(err.contains("failed to parse LLM response"), "{err}");
+        assert!(plan(r#"{"status":"thinking"}"#).is_err());
+    }
+
+    /// Models often wrap JSON in a Markdown code fence despite the prompt.
+    #[test]
+    fn a_plan_in_a_json_code_fence_is_accepted() {
+        let fenced = format!("```json\n{CONTINUE}\n```");
+        assert!(
+            matches!(plan(&fenced), Ok(StepResponse::Continue(_))),
+            "{fenced}"
+        );
+    }
+
+    #[test]
+    fn a_plan_in_a_bare_code_fence_is_accepted() {
+        let fenced = format!("  ```\n{CONTINUE}\n```\n");
+        assert!(
+            matches!(plan(&fenced), Ok(StepResponse::Continue(_))),
+            "{fenced}"
+        );
+    }
 }

@@ -593,3 +593,295 @@ fn file_time_ms(meta: &fs::Metadata) -> Option<u64> {
         .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|dur| dur.as_millis() as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh directory under the system temp directory, canonicalised (as the host resolves the
+    /// workspace root).
+    fn scratch(name: &str) -> Utf8PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("hostd-unit-{name}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = fs::canonicalize(dir).expect("canonical scratch dir");
+        Utf8PathBuf::from_path_buf(dir).expect("UTF-8 scratch dir")
+    }
+
+    fn config(root: &Utf8Path, allow_proc: &[&str]) -> HostConfig {
+        HostConfig {
+            workspace_root: root.to_path_buf(),
+            allowed_proc_commands: allow_proc.iter().map(|s| s.to_string()).collect(),
+            llm: None,
+            browser: None,
+        }
+    }
+
+    /// Run one action through an executor over `root`; its report.
+    fn run(root: &Utf8Path, allow_proc: &[&str], capability: &str, input: Value) -> ActionReport {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let mut executor = ActionExecutor::new(config(root, allow_proc), runtime.handle().clone());
+        let action = PlannedAction {
+            capability: capability.to_string(),
+            input: input.to_string(),
+            audit_tag: None,
+        };
+        executor.execute(&[action]).remove(0)
+    }
+
+    // ── Workspace path resolution ───────────────────────────────────────────
+
+    #[test]
+    fn an_empty_path_is_the_workspace_root() {
+        let root = Utf8Path::new("/work/sandbox");
+        assert_eq!(resolve_workspace_child(root, "").unwrap(), root);
+    }
+
+    #[test]
+    fn a_relative_path_resolves_under_the_root() {
+        let root = Utf8Path::new("/work/sandbox");
+        assert_eq!(
+            resolve_workspace_child(root, "src/main.rs").unwrap(),
+            Utf8Path::new("/work/sandbox/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn current_directory_segments_are_dropped() {
+        let root = Utf8Path::new("/work/sandbox");
+        assert_eq!(
+            resolve_workspace_child(root, "./a/./b").unwrap(),
+            Utf8Path::new("/work/sandbox/a/b")
+        );
+    }
+
+    #[test]
+    fn a_parent_segment_is_refused() {
+        let root = Utf8Path::new("/work/sandbox");
+        for path in ["../etc/passwd", "a/../../etc", "a/.."] {
+            assert!(resolve_workspace_child(root, path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_path_is_refused() {
+        let root = Utf8Path::new("/work/sandbox");
+        assert!(resolve_workspace_child(root, "/etc/passwd").is_err());
+    }
+
+    /// `/work/sandbox2` shares a string prefix with `/work/sandbox` but is not inside it.
+    #[test]
+    fn a_sibling_sharing_the_roots_prefix_is_outside() {
+        let root = Utf8Path::new("/work/sandbox");
+        assert!(ensure_within_workspace(root, Utf8Path::new("/work/sandbox2/secret")).is_err());
+        assert!(ensure_within_workspace(root, Utf8Path::new("/work/sandbox/inner")).is_ok());
+    }
+
+    /// Known gap (README, Status): the check is lexical, so a symlink inside the workspace that points
+    /// out of it is followed.
+    #[test]
+    #[ignore = "known gap: the workspace check is lexical and follows symlinks out of the workspace"]
+    fn a_symlink_out_of_the_workspace_is_refused() {
+        let root = scratch("symlink");
+        let outside = scratch("outside");
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.as_std_path(), root.join("escape").as_std_path())
+            .unwrap();
+        let report = run(
+            &root,
+            &[],
+            "fs.read_file",
+            json!({ "path": "escape/secret.txt" }),
+        );
+        assert!(
+            !report.success,
+            "read through a symlink: {:?}",
+            report.output
+        );
+    }
+
+    // ── fs actions ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_dir_lists_the_workspace() {
+        let root = scratch("list");
+        fs::write(root.join("a.txt"), "a").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        let report = run(&root, &[], "fs.list_dir", json!({}));
+        assert!(report.success, "{:?}", report.error);
+        let mut entries: Vec<(String, String)> = report.output["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap().to_string(),
+                    e["kind"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                ("a.txt".to_string(), "file".to_string()),
+                ("sub".to_string(), "directory".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn read_file_reads_within_max_bytes_and_flags_truncation() {
+        let root = scratch("read");
+        fs::write(root.join("notes.txt"), "hello world").unwrap();
+        let whole = run(&root, &[], "fs.read_file", json!({ "path": "notes.txt" }));
+        assert_eq!(whole.output["contents"], "hello world");
+        assert_eq!(whole.output["truncated"], false);
+        let part = run(
+            &root,
+            &[],
+            "fs.read_file",
+            json!({ "path": "notes.txt", "max_bytes": 5 }),
+        );
+        assert_eq!(part.output["contents"], "hello");
+        assert_eq!(part.output["truncated"], true);
+    }
+
+    #[test]
+    fn read_file_returns_base64_for_bytes_that_are_not_utf8() {
+        let root = scratch("binary");
+        fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00]).unwrap();
+        let report = run(&root, &[], "fs.read_file", json!({ "path": "blob.bin" }));
+        assert_eq!(report.output["encoding"], "base64");
+        assert_eq!(report.output["contents"], Base64.encode([0xff, 0xfe, 0x00]));
+    }
+
+    #[test]
+    fn read_file_refuses_an_empty_path() {
+        let root = scratch("empty");
+        let report = run(&root, &[], "fs.read_file", json!({ "path": " " }));
+        assert!(!report.success);
+    }
+
+    #[test]
+    fn an_unknown_capability_is_a_failed_report() {
+        let root = scratch("unknown");
+        let report = run(&root, &[], "fs.delete_everything", json!({}));
+        assert!(!report.success);
+        assert!(report.error.unwrap().contains("unsupported capability"));
+    }
+
+    #[test]
+    fn input_that_does_not_match_the_capability_is_a_failed_report() {
+        let root = scratch("badinput");
+        let report = run(&root, &[], "fs.read_file", json!({ "file": "x" }));
+        assert!(!report.success);
+    }
+
+    // ── proc actions ────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_unlisted_command_is_refused() {
+        let root = scratch("unlisted");
+        let report = run(&root, &["echo"], "proc.spawn", json!({ "command": "pwd" }));
+        assert!(!report.success);
+        assert!(report.error.unwrap().contains("not allowed by policy"));
+    }
+
+    #[test]
+    fn an_allowed_command_runs_in_the_workspace() {
+        let root = scratch("allowed");
+        let pwd = which("pwd");
+        let report = run(
+            &root,
+            &[pwd.as_str()],
+            "proc.spawn",
+            json!({ "command": pwd }),
+        );
+        assert!(report.success, "{:?}", report.error);
+        assert_eq!(report.output["status"], 0);
+        assert_eq!(
+            report.output["stdout"].as_str().unwrap().trim(),
+            root.as_str()
+        );
+    }
+
+    #[test]
+    fn a_spawned_command_gets_only_the_environment_it_is_given() {
+        let root = scratch("env");
+        let env = which("env");
+        let report = run(
+            &root,
+            &[env.as_str()],
+            "proc.spawn",
+            json!({ "command": env, "env": [{ "key": "ONLY", "value": "this" }] }),
+        );
+        assert!(report.success, "{:?}", report.error);
+        assert_eq!(
+            report.output["stdout"].as_str().unwrap().trim(),
+            "ONLY=this"
+        );
+    }
+
+    /// Known gap (README, Status): the allowlist matches a command's base name, so any program named
+    /// like an allowed one runs.
+    #[test]
+    #[ignore = "known gap: the allowlist matches base names, so /any/dir/ls passes for `ls`"]
+    fn the_allowlist_matches_the_resolved_program_not_its_base_name() {
+        let root = scratch("basename");
+        let fake = root.join("pwd");
+        fs::write(&fake, "#!/bin/sh\necho planted\n").unwrap();
+        let mut perms = fs::metadata(&fake).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&fake, perms).unwrap();
+        let report = run(
+            &root,
+            &["pwd"],
+            "proc.spawn",
+            json!({ "command": fake.as_str() }),
+        );
+        assert!(!report.success, "a planted `pwd` ran: {:?}", report.output);
+    }
+
+    /// Known gap (README, Status): loader variables from the plan reach the spawned process.
+    #[test]
+    #[ignore = "known gap: plan-supplied LD_* variables reach the spawned process"]
+    fn loader_variables_from_the_plan_are_dropped() {
+        let root = scratch("ld");
+        let env = which("env");
+        let report = run(
+            &root,
+            &[env.as_str()],
+            "proc.spawn",
+            json!({ "command": env, "env": [{ "key": "LD_PRELOAD", "value": "/tmp/x.so" }] }),
+        );
+        let stdout = report.output["stdout"].as_str().unwrap_or_default();
+        assert!(!stdout.contains("LD_PRELOAD"), "{stdout}");
+    }
+
+    /// The absolute path of `program` on this machine's PATH.
+    fn which(program: &str) -> String {
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(program))
+                    .find(|p| p.is_file())
+            })
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| panic!("{program} is not on PATH"))
+    }
+
+    // ── Browser actions, without a browser ──────────────────────────────────
+
+    #[test]
+    fn browser_actions_are_off_without_a_browser_section() {
+        let root = scratch("nobrowser");
+        let report = run(&root, &[], "browser.open_session", json!({ "alias": "s1" }));
+        assert!(!report.success);
+        assert!(report.error.unwrap().contains("disabled"));
+    }
+}
