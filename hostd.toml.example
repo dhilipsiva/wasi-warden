@@ -1,0 +1,20 @@
+# Copy to hostd.toml (git-ignored, since it holds an API key) and edit. hostd reads ./hostd.toml by
+# default (`--config` to change it); without one, the workspace is the current directory, no command
+# may run and no LLM is configured.
+
+# The directory the fs capability is confined to (overridden by --workspace).
+workspace_root = "./sandbox"
+
+# Commands the proc capability may run (more with --allow-proc).
+allow_proc = ["ls", "echo"]
+
+# Any OpenAI-compatible chat-completions endpoint. This one is a local Ollama.
+[llm]
+api_base = "http://127.0.0.1:11434/v1"
+api_key = "ollama"
+model = "phi3.5"
+
+# Browser tasks need a running WebDriver (Chromedriver, Geckodriver, ...).
+# [browser]
+# webdriver_url = "http://127.0.0.1:9515"
+# default_profile = "default"

@@ -228,7 +228,7 @@ Order matters. Do this:
 
 4. **Host loop**
 
-   * `hostd step --task "run tests" --obs '{}'`
+   * `hostd step --task "run tests" --observation '{}'`
    * Calls `agent.step`.
    * Parses returned actions JSON.
    * Executes allowed actions via `fs`/`proc` modules.

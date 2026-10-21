@@ -1,7 +1,0 @@
-workspace_root = "./sandbox"
-allow_proc = ["ls", "echo"]
-
-[llm]
-api_base = "http://127.0.0.1:11434/v1"
-api_key = "ollama"
-model = "phi3.5"

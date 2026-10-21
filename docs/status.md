@@ -1,11 +1,11 @@
 ## Project Status — Host Execution Loop + Browser Automation
 
-_Last updated: 2024-11-23_
+_Last updated: 2025-11-14_
 
 ### What’s Working
 
 - **Planner ↔ host loop (`hostd/src/runtime.rs`)**  
-  `hostd run step` now instantiates the component, requests a plan, executes the returned `planned-action`s via the `ActionExecutor`, and feeds structured observations back into the next `planner.step` call. Execution is bounded by `MAX_HOST_STEPS` to prevent runaway planners.
+  `hostd step` now instantiates the component, requests a plan, executes the returned `planned-action`s via the `ActionExecutor`, and feeds structured observations back into the next `planner.step` call. Execution is bounded by `MAX_HOST_STEPS` to prevent runaway planners.
 
 - **Filesystem + process capabilities (`hostd/src/actions.rs`)**  
   Scoped FS read/list and allowlisted process spawning are implemented in the action executor. The executor enforces workspace-relative paths, UTF-8 handling, truncation limits, and command allowlists from `hostd.toml`.

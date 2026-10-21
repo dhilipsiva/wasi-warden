@@ -4,3 +4,7 @@ members = [ "agent-core",
     "tools/wit-check",
 ]
 resolver = "2"
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dhilipsiva/wasi-warden"

@@ -1,8 +1,12 @@
 # wasi-warden
 
-Secure, local-first OS automation for LLMs.
+> **Status: design spike, Nov 2025.** 0 tests; policy, budgets, audit and fuel are unimplemented;
+> wasmtime 30 carries sandbox-escape advisories; do not run it on a machine or data you care about.
+> What works and what does not is listed under [Status](#status).
 
-`wasi-warden` runs an untrusted “brain” inside a WebAssembly/WASI sandbox and exposes a narrow, auditable set of capabilities from a Rust host: files, processes, browser automation, and (optionally) keyboard/mouse input. It is designed so an LLM can plan and execute complex tasks on a machine without ever getting raw, ambient system access.
+Secure, local-first OS automation for LLMs: the design.
+
+`wasi-warden` is meant to run an untrusted "brain" inside a WebAssembly/WASI sandbox and expose a narrow, auditable set of capabilities from a Rust host: files, processes, browser automation, and (optionally) keyboard/mouse input. The goal is that an LLM can plan and execute tasks on a machine without ever getting raw, ambient system access.
 
 Think: **computer-use / RPA / ops runbooks**, but:
 
@@ -12,14 +16,14 @@ Think: **computer-use / RPA / ops runbooks**, but:
 * policy-driven
 * LLM-agnostic
 
-For instance, let's say you want to loginto a website using browser automation:
+For instance, a browser login task (the browser path panics today, so this does not complete yet; see [Status](#status)):
 
 ```
 cargo run -p hostd -- step \
   --task "Log into https://demo.example/login with creds in secrets/demo-login.json and confirm the dashboard greets the user."
 ```
 
-More about running this sample task here: https://github.com/FossRust/wasi-warden/blob/main/docs/browser-login-task.md
+The sample task is described in [docs/browser-login-task.md](docs/browser-login-task.md).
 
 ---
 
@@ -57,15 +61,15 @@ If you are fine with a hosted black box, you do not need this project.
 
    * Files: scoped to configured workspaces.
    * Processes: allowlisted commands.
-   * Browser: controlled via WebDriver / CDP.
-   * Input: optional, off by default, behind a hard switch.
+   * Browser: controlled via WebDriver.
+   * Input: optional and off by default (not implemented yet).
 
 4. **LLM-agnostic control**
 
    * Any LLM that can speak JSON / tool-calls can drive `wasi-warden`.
    * Local models and cloud APIs both work via a single `llm` capability.
 
-5. **Audit, budgets, verification**
+5. **Audit, budgets, verification** (planned; see [Status](#status))
 
    * Every action is logged.
    * Per-task limits on steps, time, and scope.
@@ -110,16 +114,29 @@ The agent never talks to the OS directly. It can only call what `hostd` exposes.
 
 ## Status
 
-Early design and scaffolding.
+A four-day spike (2025-11-11 to 2025-11-15). What exists:
 
-Initial goals:
+* WIT interfaces for `fs`, `proc`, `browser`, `input`, `llm`, `policy` and the `agent` planner (`wit/`).
+* A Rust host (`hostd`) on the Wasmtime component model that loads the agent component.
+* A Rust guest (`agent-core`) built as a WASI Preview 2 component. It formats the prompt, calls the `llm`
+  capability and parses the returned JSON plan; it calls no other capability itself.
+* A bounded loop: `hostd step` asks the planner for a plan, executes its actions natively (`hostd/src/actions.rs`)
+  and feeds the results back, for at most 8 rounds (`MAX_HOST_STEPS`).
 
-* [ ] Minimal WIT interfaces for `fs`, `proc`, `llm`, `agent`.
-* [ ] Rust host using Wasmtime component model.
-* [ ] Rust guest built as WASI component calling `llm` + returning action plans.
-* [ ] End-to-end: given a task, run a bounded loop of “plan → act via capabilities → observe”.
+What does not work yet:
 
-Expect breaking changes. Do not run in production yet.
+* **No tests**, and `cargo clippy --all-targets -- -D warnings` fails.
+* **Browser actions panic**: every one calls `Handle::block_on` inside the async runtime.
+* **Nothing is enforced beyond the round cap**: no wasm fuel or epoch limit, no wall-clock or token budget, no
+  audit log. The `policy` capability and every `input` call return `Denied`.
+* **The sandbox isolates only prompt-building code**: the planning happens in the LLM and the actions run in the
+  native host, outside the sandbox.
+* **Known security gaps**: the workspace check is a lexical path prefix (symlinks can escape it), the process
+  allowlist matches a command's base name, environment variables from the plan are passed through, and
+  Chrome runs with `--no-sandbox`.
+* **wasmtime 30.0.2** has published sandbox-escape advisories; the fix is an upgrade to 49.
+
+Expect breaking changes. The progress snapshot is in [docs/status.md](docs/status.md).
 
 ---
 
@@ -135,19 +152,19 @@ Expect breaking changes. Do not run in production yet.
   * Used for tests, formatters, build tools, etc.
 * **Browser**
 
-  * Sessions over WebDriver/CDP.
+  * Sessions over WebDriver.
   * Navigate, click, type, scrape DOM/HTML.
 * **Input (opt-in, high-risk)**
 
   * Global keyboard and mouse via OS-specific backends.
-  * Fully disabled by default; gated by config and build flag.
+  * Fully disabled by default.
 * **LLM integration**
 
   * Single interface for OpenAI-compatible and local models.
   * Supports tool-calling / JSON plans.
 * **Policies**
 
-  * TOML/YAML config:
+  * TOML config:
 
     * allowed paths, binaries, domains,
     * per-task budgets,
@@ -155,82 +172,47 @@ Expect breaking changes. Do not run in production yet.
 * **Observability**
 
   * Structured logs for all calls.
-  * Optional JSON event stream for external auditors/UIS.
+  * Optional JSON event stream for external auditors/UIs.
 
 ---
 
 ## Getting started (dev)
 
-Prerequisites:
+Prerequisites: [Nix](https://nixos.org/) with flakes, whose dev shell provides Rust 1.91.1 with the
+`wasm32-wasip2` target (or a Rust toolchain with that target installed), and an OpenAI-compatible LLM endpoint
+(a local [Ollama](https://ollama.com/) works).
 
-* Rust (stable)
-* `cargo-component` (for WASI components)
-* `wasmtime` runtime via Cargo dependencies
-
-Clone:
+From the repository root:
 
 ```bash
-git clone https://github.com/FossRust/wasi-warden.git
+git clone https://github.com/dhilipsiva/wasi-warden.git
 cd wasi-warden
+nix develop                                               # the pinned toolchain
+cargo build -p hostd                                      # the host
+cargo build -p agent-core --target wasm32-wasip2 --release  # the agent component
+cp hostd.toml.example hostd.toml                          # then edit: workspace, allowlist, LLM endpoint
+cargo run -p hostd -- step --task "List workspace files" --observation '{}'
 ```
 
-Build host:
+`hostd step` loads `./target/wasm32-wasip2/release/agent_core.wasm` (`--component` to change it), asks the
+planner for a JSON plan, runs the allowed actions, and repeats with their results until the planner reports
+the task complete or 8 rounds pass. `hostd step --help` lists the flags.
 
-```bash
-cd hostd
-cargo build
-```
-
-Build agent-core (WASI component):
-
-```bash
-cd ../agent-core
-cargo component build --release
-```
-
-Copy the sample configuration and edit it with your workspace, process allowlist, and API keys:
-
-```bash
-cp ../hostd-sample.toml ../hostd.toml
-# edit hostd.toml
-```
-
-To enable browser tasks, point the host at a running WebDriver (Chromedriver, Geckodriver, etc.):
+To try browser tasks, point the host at a running WebDriver (Chromedriver, Geckodriver, etc.) in `hostd.toml`:
 
 ```toml
 [browser]
 webdriver_url = "http://127.0.0.1:9515"
 default_profile = "default"
 ```
- 
-Each browser action in planner JSON must assign an `alias` for new sessions/elements so follow-up actions (click/type/etc.) can reference them.
 
-See `docs/browser-login-task.md` for a fully worked example and `docs/status.md` for the latest progress snapshot / TODOs before resuming work.
-
-Run a test step (placeholder, subject to change):
-
-```bash
-cd ../hostd
-cargo run -- step \
-  --task "List workspace files" \
-  --obs '{}'
-```
-
-This should:
-
-1. Load `agent-core.wasm`.
-2. Call `agent.step(task, obs)`.
-3. Parse returned JSON actions.
-4. Execute allowed actions via `fs` capability.
-5. Print results.
-
-Concrete commands and config paths will evolve as the API stabilizes.
+Each browser action in planner JSON must assign an `alias` for new sessions/elements so follow-up actions (click/type/etc.) can reference them. See [docs/browser-login-task.md](docs/browser-login-task.md) for a worked example.
 
 ---
 
 ## Security model
 
-Non-negotiable rules:
+The design's rules:
 
 * Sandbox first:
 
@@ -249,7 +231,9 @@ Non-negotiable rules:
 
   * Every capability call is logged with inputs, outputs, and task ID.
 
-If any of this is compromised, it is a bug.
+**Today nothing beyond the round cap (`MAX_HOST_STEPS`, 8) is enforced**: there are no runtime, fuel or token
+limits and no audit log, and the gaps listed under [Status](#status) apply. Whatever the planner reads, a
+secrets file included, is sent to the configured LLM provider, so with a cloud model it leaves the machine.
 
 ---
 
@@ -294,3 +278,13 @@ Planned expectations:
   * behind config.
 
 Open issues and discussions will drive the initial design; send PRs that tighten guarantees, not weaken them.
+
+---
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your
+option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as
+defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
