@@ -20,7 +20,19 @@ use crate::state::HostState;
 
 const MAX_HOST_STEPS: u32 = 8;
 
+/// Run the plan-act loop for `args`. The loop blocks: wasmtime calls the component synchronously,
+/// the `llm` capability makes blocking HTTP requests, and the executor drives WebDriver futures with
+/// `Handle::block_on`, which panics on a runtime worker thread. So it runs on a blocking thread,
+/// where `block_on` is allowed, and the executor's `Drop` (which quits browser sessions) runs there
+/// too.
 pub async fn run_step(args: StepArgs) -> Result<()> {
+    let tokio_handle = Handle::current();
+    tokio::task::spawn_blocking(move || run_step_blocking(args, tokio_handle))
+        .await
+        .context("the step thread panicked")?
+}
+
+fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
     let config = HostConfig::from_step_args(&args)?;
     let engine = build_engine()?;
     let component = load_component(&engine, &args.component)?;
@@ -39,8 +51,7 @@ pub async fn run_step(args: StepArgs) -> Result<()> {
         .context("failed to add WASI to linker")?;
     bindings::Control::add_to_linker::<_, HasSelf<_>>(&mut linker, |state: &mut HostState| state)?;
 
-    let tokio_handle = Handle::current();
-    let mut executor = ActionExecutor::new(config.clone(), tokio_handle.clone());
+    let mut executor = ActionExecutor::new(config.clone(), tokio_handle);
 
     let mut store = Store::new(&engine, HostState::new(config.clone()));
     let control = bindings::Control::instantiate(&mut store, &component, &linker)

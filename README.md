@@ -1,6 +1,6 @@
 # wasi-warden
 
-> **Status: design spike, Nov 2025.** One end-to-end test; policy, budgets, audit and fuel are
+> **Status: design spike, Nov 2025.** Two end-to-end tests; policy, budgets, audit and fuel are
 > unimplemented; do not run it on a machine or data you care about.
 > What works and what does not is listed under [Status](#status).
 
@@ -16,7 +16,7 @@ Think: **computer-use / RPA / ops runbooks**, but:
 * policy-driven
 * LLM-agnostic
 
-For instance, a browser login task (the browser path panics today, so this does not complete yet; see [Status](#status)):
+For instance, a browser login task (the planner's prompt does not list the browser actions yet, so a real model has to guess their names; see [Status](#status)):
 
 ```
 cargo run -p hostd -- step \
@@ -125,9 +125,11 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
 
 What does not work yet:
 
-* **One test**: `hostd/tests/step_e2e.rs` runs a step end to end against a scripted LLM (it needs the agent
-  component built first: `cargo test -p hostd -- --include-ignored`). There is no CI yet.
-* **Browser actions panic**: every one calls `Handle::block_on` inside the async runtime.
+* **Two tests**: `hostd/tests/step_e2e.rs` runs a step end to end against a scripted LLM, and
+  `hostd/tests/browser_e2e.rs` opens, navigates and quits a browser session against a fake WebDriver. Both need
+  the agent component built first (`cargo test -p hostd -- --include-ignored`). There is no CI yet.
+* **The planner's prompt lists only `fs.list_dir`, `fs.read_file` and `proc.spawn`**, though the host runs eleven
+  actions, browser ones included; a model has to guess the rest.
 * **Nothing is enforced beyond the round cap**: no wasm fuel or epoch limit, no wall-clock or token budget, no
   audit log. The `policy` capability and every `input` call return `Denied`.
 * **The sandbox isolates only prompt-building code**: the planning happens in the LLM and the actions run in the

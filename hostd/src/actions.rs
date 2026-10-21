@@ -44,6 +44,8 @@ impl ActionReport {
     }
 }
 
+/// Runs the planner's actions. Browser actions drive WebDriver futures with `Handle::block_on`, so
+/// an executor lives on a blocking thread (`runtime::run_step`), never on a runtime worker.
 pub struct ActionExecutor {
     config: HostConfig,
     tokio: Handle,
