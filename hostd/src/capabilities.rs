@@ -158,9 +158,7 @@ fn convert_usage(usage: Option<ChatUsage>) -> Option<bindings::osagent::llm::llm
     })
 }
 
-fn messages_to_chat(
-    messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
-) -> Vec<ChatMessage> {
+fn messages_to_chat(messages: Vec<bindings::osagent::llm::llm::Message>) -> Vec<ChatMessage> {
     messages
         .into_iter()
         .map(|msg| ChatMessage {
@@ -177,7 +175,7 @@ fn messages_to_chat(
 }
 
 fn tools_to_chat(
-    tools: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::ToolSchema>,
+    tools: Vec<bindings::osagent::llm::llm::ToolSchema>,
 ) -> Result<Vec<ChatTool>, CapabilityError> {
     let mut result = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -201,7 +199,7 @@ fn tools_to_chat(
 
 fn build_chat_request(
     model: &str,
-    messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
+    messages: Vec<bindings::osagent::llm::llm::Message>,
     options: bindings::osagent::llm::llm::Options,
     tools: Option<Vec<ChatTool>>,
 ) -> ChatRequest {
@@ -490,7 +488,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
     fn open_dir(
         &mut self,
         parent: Resource<DirHandle>,
-        relative_path: wasmtime::component::__internal::String,
+        relative_path: String,
     ) -> Result<Resource<DirHandle>, CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
         let candidate = resolve_child(&parent_path, &relative_path)?;
@@ -509,7 +507,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
     fn ensure_dir(
         &mut self,
         parent: Resource<DirHandle>,
-        relative_path: wasmtime::component::__internal::String,
+        relative_path: String,
     ) -> Result<Resource<DirHandle>, CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
         let candidate = resolve_child(&parent_path, &relative_path)?;
@@ -522,7 +520,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
     fn remove_dir(
         &mut self,
         parent: Resource<DirHandle>,
-        relative_path: wasmtime::component::__internal::String,
+        relative_path: String,
         recursive: bool,
     ) -> Result<(), CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
@@ -538,7 +536,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
     fn remove_file(
         &mut self,
         parent: Resource<DirHandle>,
-        relative_path: wasmtime::component::__internal::String,
+        relative_path: String,
     ) -> Result<(), CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
         let target = resolve_child(&parent_path, &relative_path)?;
@@ -549,8 +547,8 @@ impl bindings::osagent::fs::fs::Host for HostState {
     fn rename(
         &mut self,
         parent: Resource<DirHandle>,
-        old_path: wasmtime::component::__internal::String,
-        new_path: wasmtime::component::__internal::String,
+        old_path: String,
+        new_path: String,
     ) -> Result<(), CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
         let from = resolve_child(&parent_path, &old_path)?;
@@ -563,10 +561,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
     fn list_dir(
         &mut self,
         target: Resource<DirHandle>,
-    ) -> Result<
-        wasmtime::component::__internal::Vec<bindings::osagent::fs::fs::DirEntry>,
-        CapabilityError,
-    > {
+    ) -> Result<Vec<bindings::osagent::fs::fs::DirEntry>, CapabilityError> {
         let dir_path = dir_path(self, &target)?.to_path_buf();
         let mut entries = Vec::new();
         let read = fs::read_dir(&dir_path).map_err(|err| io_error("fs.list-dir", err))?;
@@ -587,7 +582,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
     fn metadata(
         &mut self,
         parent: Resource<DirHandle>,
-        relative_path: Option<wasmtime::component::__internal::String>,
+        relative_path: Option<String>,
     ) -> Result<bindings::osagent::fs::fs::EntryMetadata, CapabilityError> {
         let base = dir_path(self, &parent)?.to_path_buf();
         let path = if let Some(rel) = relative_path {
@@ -614,7 +609,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
     fn open_file(
         &mut self,
         parent: Resource<DirHandle>,
-        relative_path: wasmtime::component::__internal::String,
+        relative_path: String,
         options: bindings::osagent::fs::fs::FileOpenOptions,
     ) -> Result<Resource<FileHandle>, CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
@@ -655,7 +650,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
         &mut self,
         handle: Resource<FileHandle>,
         max_bytes: u64,
-    ) -> Result<wasmtime::component::__internal::Vec<u8>, CapabilityError> {
+    ) -> Result<Vec<u8>, CapabilityError> {
         read_file_bytes(self, &handle, max_bytes, "fs.file.read")
     }
 
@@ -663,7 +658,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
         &mut self,
         handle: Resource<FileHandle>,
         max_bytes: u64,
-    ) -> Result<wasmtime::component::__internal::String, CapabilityError> {
+    ) -> Result<String, CapabilityError> {
         let bytes = read_file_bytes(self, &handle, max_bytes, "fs.file.read-to-string")?;
         String::from_utf8(bytes).map_err(|_| {
             capability_error(
@@ -676,7 +671,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
     fn write(
         &mut self,
         handle: Resource<FileHandle>,
-        bytes: wasmtime::component::__internal::Vec<u8>,
+        bytes: Vec<u8>,
     ) -> Result<u64, CapabilityError> {
         write_file_bytes(self, &handle, &bytes, "fs.file.write")
     }
@@ -684,7 +679,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
     fn write_string(
         &mut self,
         handle: Resource<FileHandle>,
-        contents: wasmtime::component::__internal::String,
+        contents: String,
         newline: bool,
     ) -> Result<u64, CapabilityError> {
         let mut data = contents.into_bytes();
@@ -725,7 +720,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
 impl bindings::osagent::proc::proc::Host for HostState {
     fn spawn(
         &mut self,
-        command: wasmtime::component::__internal::String,
+        command: String,
         options: bindings::osagent::proc::proc::SpawnOptions,
     ) -> Result<Resource<ProcHandle>, CapabilityError> {
         ensure_command_allowed(&self.config, &command)?;
@@ -810,7 +805,7 @@ impl bindings::osagent::proc::proc::HostProcess for HostState {
     fn write_stdin(
         &mut self,
         _: Resource<ProcHandle>,
-        _chunk: wasmtime::component::__internal::Vec<u8>,
+        _chunk: Vec<u8>,
         _eof: bool,
     ) -> Result<u32, CapabilityError> {
         Err(capability_error(
@@ -900,7 +895,7 @@ impl bindings::osagent::browser::browser::HostSession for HostState {
     fn goto(
         &mut self,
         _rep: Resource<bindings::osagent::browser::browser::Session>,
-        _url: wasmtime::component::__internal::String,
+        _url: String,
         _timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
     ) -> Result<bindings::osagent::browser::browser::PageState, CapabilityError> {
         Err(capability_error(
@@ -934,7 +929,7 @@ impl bindings::osagent::browser::browser::HostSession for HostState {
     fn eval(
         &mut self,
         _rep: Resource<bindings::osagent::browser::browser::Session>,
-        _expression: wasmtime::component::__internal::String,
+        _expression: String,
     ) -> Result<bindings::osagent::common::types::Json, CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
@@ -958,12 +953,8 @@ impl bindings::osagent::browser::browser::HostSession for HostState {
         &mut self,
         _rep: Resource<bindings::osagent::browser::browser::Session>,
         _selector: bindings::osagent::browser::browser::Selector,
-    ) -> Result<
-        wasmtime::component::__internal::Vec<
-            Resource<bindings::osagent::browser::browser::ElementHandle>,
-        >,
-        CapabilityError,
-    > {
+    ) -> Result<Vec<Resource<bindings::osagent::browser::browser::ElementHandle>>, CapabilityError>
+    {
         Err(capability_error(
             CapabilityErrorCode::Denied,
             "browser capability is not implemented",
@@ -985,7 +976,7 @@ impl bindings::osagent::browser::browser::HostElementHandle for HostState {
     fn type_text(
         &mut self,
         _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-        _text: wasmtime::component::__internal::String,
+        _text: String,
         _submit: bool,
     ) -> Result<(), CapabilityError> {
         Err(capability_error(
@@ -1007,8 +998,8 @@ impl bindings::osagent::browser::browser::HostElementHandle for HostState {
     fn attribute(
         &mut self,
         _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-        _name: wasmtime::component::__internal::String,
-    ) -> Result<Option<wasmtime::component::__internal::String>, CapabilityError> {
+        _name: String,
+    ) -> Result<Option<String>, CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
             "browser capability is not implemented",
@@ -1018,7 +1009,7 @@ impl bindings::osagent::browser::browser::HostElementHandle for HostState {
     fn inner_text(
         &mut self,
         _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-    ) -> Result<wasmtime::component::__internal::String, CapabilityError> {
+    ) -> Result<String, CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
             "browser capability is not implemented",
@@ -1028,7 +1019,7 @@ impl bindings::osagent::browser::browser::HostElementHandle for HostState {
     fn html(
         &mut self,
         _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-    ) -> Result<wasmtime::component::__internal::String, CapabilityError> {
+    ) -> Result<String, CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
             "browser capability is not implemented",
@@ -1044,10 +1035,7 @@ impl bindings::osagent::browser::browser::HostElementHandle for HostState {
 }
 
 impl bindings::osagent::input::input::Host for HostState {
-    fn key_sequence(
-        &mut self,
-        _text: wasmtime::component::__internal::String,
-    ) -> Result<(), CapabilityError> {
+    fn key_sequence(&mut self, _text: String) -> Result<(), CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
             "input capability is not implemented",
@@ -1099,7 +1087,7 @@ impl bindings::osagent::input::input::Host for HostState {
 impl bindings::osagent::llm::llm::Host for HostState {
     fn complete(
         &mut self,
-        messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
+        messages: Vec<bindings::osagent::llm::llm::Message>,
         options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::CompletionResponse, CapabilityError> {
         let settings = require_llm_settings(&self.config)?;
@@ -1128,8 +1116,8 @@ impl bindings::osagent::llm::llm::Host for HostState {
 
     fn call_tools(
         &mut self,
-        messages: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::Message>,
-        tools: wasmtime::component::__internal::Vec<bindings::osagent::llm::llm::ToolSchema>,
+        messages: Vec<bindings::osagent::llm::llm::Message>,
+        tools: Vec<bindings::osagent::llm::llm::ToolSchema>,
         options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::ToolResponse, CapabilityError> {
         let settings = require_llm_settings(&self.config)?;

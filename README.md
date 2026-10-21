@@ -1,7 +1,7 @@
 # wasi-warden
 
-> **Status: design spike, Nov 2025.** 0 tests; policy, budgets, audit and fuel are unimplemented;
-> wasmtime 30 carries sandbox-escape advisories; do not run it on a machine or data you care about.
+> **Status: design spike, Nov 2025.** One end-to-end test; policy, budgets, audit and fuel are
+> unimplemented; do not run it on a machine or data you care about.
 > What works and what does not is listed under [Status](#status).
 
 Secure, local-first OS automation for LLMs: the design.
@@ -125,7 +125,8 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
 
 What does not work yet:
 
-* **No tests**, and `cargo clippy --all-targets -- -D warnings` fails.
+* **One test**: `hostd/tests/step_e2e.rs` runs a step end to end against a scripted LLM (it needs the agent
+  component built first: `cargo test -p hostd -- --include-ignored`). There is no CI yet.
 * **Browser actions panic**: every one calls `Handle::block_on` inside the async runtime.
 * **Nothing is enforced beyond the round cap**: no wasm fuel or epoch limit, no wall-clock or token budget, no
   audit log. The `policy` capability and every `input` call return `Denied`.
@@ -134,7 +135,6 @@ What does not work yet:
 * **Known security gaps**: the workspace check is a lexical path prefix (symlinks can escape it), the process
   allowlist matches a command's base name, environment variables from the plan are passed through, and
   Chrome runs with `--no-sandbox`.
-* **wasmtime 30.0.2** has published sandbox-escape advisories; the fix is an upgrade to 49.
 
 Expect breaking changes. The progress snapshot is in [docs/status.md](docs/status.md).
 
@@ -178,9 +178,10 @@ Expect breaking changes. The progress snapshot is in [docs/status.md](docs/statu
 
 ## Getting started (dev)
 
-Prerequisites: [Nix](https://nixos.org/) with flakes, whose dev shell provides Rust 1.91.1 with the
-`wasm32-wasip2` target (or a Rust toolchain with that target installed), and an OpenAI-compatible LLM endpoint
-(a local [Ollama](https://ollama.com/) works).
+Prerequisites: [Nix](https://nixos.org/) with flakes, whose dev shell provides Rust 1.99.1 with the
+`wasm32-wasip2` target, chromedriver with Chromium, and Ollama (or a Rust toolchain with that target installed),
+and an OpenAI-compatible LLM endpoint (a local [Ollama](https://ollama.com/) works). `nix build .#hostd` builds
+the host binary alone.
 
 From the repository root:
 

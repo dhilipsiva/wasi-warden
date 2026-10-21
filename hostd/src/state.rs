@@ -1,5 +1,5 @@
 use wasmtime::component::ResourceTable;
-use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use crate::config::HostConfig;
 
@@ -12,7 +12,9 @@ pub struct HostState {
 
 impl HostState {
     pub fn new(config: HostConfig) -> Self {
-        let wasi_ctx = WasiCtxBuilder::new().build();
+        // No preopened directories, environment, arguments or network: the agent reaches the host only
+        // through the WIT capabilities.
+        let wasi_ctx = WasiCtx::builder().build();
         Self {
             config,
             resources: ResourceTable::new(),
@@ -21,14 +23,11 @@ impl HostState {
     }
 }
 
-impl IoView for HostState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resources
-    }
-}
-
 impl WasiView for HostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.resources,
+        }
     }
 }

@@ -5,9 +5,9 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 use wasmtime::{
     Config, Engine, Store,
-    component::{Component, Linker},
+    component::{Component, HasSelf, Linker},
 };
-use wasmtime_wasi::add_to_linker_sync;
+use wasmtime_wasi::p2::add_to_linker_sync;
 
 use tokio::runtime::Handle;
 
@@ -34,20 +34,24 @@ pub async fn run_step(args: StepArgs) -> Result<()> {
     };
 
     let mut linker: Linker<HostState> = Linker::new(&engine);
-    add_to_linker_sync(&mut linker).context("failed to add WASI to linker")?;
-    bindings::Control::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    add_to_linker_sync(&mut linker)
+        .map_err(anyhow::Error::from)
+        .context("failed to add WASI to linker")?;
+    bindings::Control::add_to_linker::<_, HasSelf<_>>(&mut linker, |state: &mut HostState| state)?;
 
     let tokio_handle = Handle::current();
     let mut executor = ActionExecutor::new(config.clone(), tokio_handle.clone());
 
     let mut store = Store::new(&engine, HostState::new(config.clone()));
     let control = bindings::Control::instantiate(&mut store, &component, &linker)
+        .map_err(anyhow::Error::from)
         .context("failed to instantiate component")?;
     let planner = control.osagent_agent_planner();
 
     for iteration in 0..MAX_HOST_STEPS {
         let planner_result = planner
             .call_step(&mut store, &args.task, &observation)
+            .map_err(anyhow::Error::from)
             .context("planner.step failed")?;
         let response = planner_result.map_err(agent_failure)?;
 
@@ -88,15 +92,17 @@ pub async fn run_step(args: StepArgs) -> Result<()> {
 }
 
 fn build_engine() -> Result<Engine> {
+    // Wasm backtraces are on by default (20 frames).
     let mut config = Config::default();
-    config.wasm_backtrace(true);
     config.wasm_component_model(true);
-    config.async_support(false);
-    Engine::new(&config).context("failed to build Wasmtime engine")
+    Engine::new(&config)
+        .map_err(anyhow::Error::from)
+        .context("failed to build Wasmtime engine")
 }
 
 fn load_component(engine: &Engine, path: &PathBuf) -> Result<Component> {
     Component::from_file(engine, path)
+        .map_err(anyhow::Error::from)
         .with_context(|| format!("failed to load component {}", path.display()))
 }
 
