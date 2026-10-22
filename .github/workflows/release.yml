@@ -1,0 +1,267 @@
+# Releases wasi-warden (RELEASING.md is the runbook), from the products repository's release.yml
+# template. Tag -> preflight -> the CI gate -> hostd for x86_64 and aarch64 Linux and the
+# agent_core.wasm component -> a DRAFT GitHub Release with checksums and build provenance -> undraft.
+# Nothing is published to crates.io: hostd ships as binaries. A manual run is always a rehearsal:
+# it builds and packages, and creates nothing. Every action is pinned to a full commit SHA with its
+# release tag; every build runs in the flake's dev shell, as CI does.
+name: Release
+
+on:
+  push:
+    tags:
+      # Semver tags only, so an archival tag never drives a release.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to rehearse, without the leading v (blank = hostd's manifest version)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  BIN: hostd
+
+jobs:
+  setup:
+    name: Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The ancestry check needs history.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve version, tag and mode
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          manifest=$(python3 -c 'import tomllib; print(tomllib.load(open("hostd/Cargo.toml", "rb"))["package"]["version"])')
+          if [ "$EVENT" = "push" ]; then
+            version="${REF_NAME#v}"
+            dry=false
+          else
+            # A manual run is forced to a rehearsal: there is no "release for real" option to mis-click.
+            version="${INPUT_VERSION:-$manifest}"
+            dry=true
+          fi
+          case "$version" in *-*) pre=true ;; *) pre=false ;; esac
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "dry_run=$dry"
+            echo "prerelease=$pre"
+            echo "manifest=$manifest"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Release $version (dry_run=$dry, prerelease=$pre)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Tag, manifest and CHANGELOG agree
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          MANIFEST: ${{ steps.resolve.outputs.manifest }}
+          DRY: ${{ steps.resolve.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$VERSION" != "$MANIFEST" ]; then
+            echo "::error title=Version mismatch::the tag says $VERSION, hostd/Cargo.toml says $MANIFEST" >&2
+            exit 1
+          fi
+          if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+            if [ "$DRY" = "true" ]; then
+              echo "::warning title=CHANGELOG not rolled::CHANGELOG.md has no '## [$VERSION]' section yet; a tag would be refused"
+            else
+              echo "::error title=CHANGELOG not rolled::CHANGELOG.md has no '## [$VERSION]' section" >&2
+              exit 1
+            fi
+          fi
+      - name: The tagged commit is on main
+        if: github.event_name == 'push'
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error title=Tag is not on main::$SHA is not on origin/main. Merge, let CI go green, then tag." >&2
+            exit 1
+          fi
+
+  gate:
+    name: CI
+    needs: setup
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build hostd (${{ matrix.target }})
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # A partial asset set must never reach the release.
+      fail-fast: true
+      matrix:
+        # Pinned runner images, so the shipped binaries' glibc floor never moves silently. The flake's
+        # dev shell builds natively on each.
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Cache the Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+      - name: Build the release binary
+        run: nix develop --extra-experimental-features 'nix-command flakes' --command cargo build --locked --release --bin "$BIN"
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          name="$BIN-$VERSION-$TARGET"
+          tar --create --gzip --file "dist/$name.tar.gz" -C target/release "$BIN" \
+            -C "$GITHUB_WORKSPACE" README.md LICENSE-MIT LICENSE-APACHE hostd.toml.example
+      - name: Keep the archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+  component:
+    name: Build agent_core.wasm
+    needs: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Cache the Nix store
+        uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+      - name: Build the component
+        run: nix develop --extra-experimental-features 'nix-command flakes' --command cargo build --locked -p agent-core --target wasm32-wasip2 --release
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/wasm32-wasip2/release/agent_core.wasm dist/agent_core.wasm
+      - name: Keep the component
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-component
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: Draft the GitHub Release
+    needs: [setup, gate, build, component]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Collect the assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          # Sorted, and never hashing itself, so the file is deterministic.
+          mapfile -t files < <(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort)
+          sha256sum -- "${files[@]}" > SHA256SUMS
+          { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Release notes from CHANGELOG
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          DRY: ${{ needs.setup.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on {print}' CHANGELOG.md > NOTES.md
+          if [ ! -s NOTES.md ]; then
+            if [ "$DRY" = "true" ]; then
+              # A rehearsal before the CHANGELOG is rolled shows the unreleased notes.
+              awk '/^## \[Unreleased\]/ {on=1; next} on && /^## \[/ {exit} on {print}' CHANGELOG.md > NOTES.md
+            fi
+            test -s NOTES.md
+          fi
+      - name: Attest the assets' build provenance
+        if: needs.setup.outputs.dry_run != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Create or update the draft release
+        if: needs.setup.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          PRERELEASE: ${{ needs.setup.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          title="wasi-warden $VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # No --draft here: passing it to `edit` on a published release would retract it.
+            gh release edit "$TAG" --title "$title" --notes-file NOTES.md
+          else
+            args=(--draft --title "$title" --notes-file NOTES.md)
+            if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+            gh release create "$TAG" "${args[@]}"
+          fi
+          gh release upload "$TAG" dist/* --clobber
+      - name: Rehearsal, what would have shipped
+        if: needs.setup.outputs.dry_run == 'true'
+        run: |
+          { echo '## Dry run: no release was created'; echo; echo '```'; ls -la dist; echo '```'; echo; cat NOTES.md; } >> "$GITHUB_STEP_SUMMARY"
+
+  finalize:
+    name: Make the release public
+    needs: [setup, release]
+    if: needs.setup.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Undraft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false

@@ -226,7 +226,8 @@ cargo run -p hostd -- run --task "List workspace files"
 planner for a JSON plan, runs the allowed actions, and repeats with their results until the planner reports
 the task complete or a budget runs out (8 rounds by default). `hostd step` runs one round instead and prints
 where it got to as JSON: the next step and its observation, to pass back with `--step` and `--observation`,
-or the completion. `hostd run --help` and `hostd step --help` list the flags.
+or the completion. `hostd run --help` and `hostd step --help` list the flags. Releases (hostd for x86_64 and aarch64
+Linux, and `agent_core.wasm`) are cut from a tag; [RELEASING.md](RELEASING.md) is the runbook.
 
 To try browser tasks, point the host at a running WebDriver (Chromedriver, Geckodriver, etc.) in `hostd.toml`:
 
