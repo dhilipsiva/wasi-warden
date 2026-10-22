@@ -7,5 +7,5 @@ repository.workspace = true
 
 [dependencies]
 anyhow = "1"
-wit-parser = "0.205"
+wit-parser = "0.258"
 ignore = "0.4"
