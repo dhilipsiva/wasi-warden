@@ -322,6 +322,10 @@ fn the_policy_capability_reports_and_enforces_the_budgets() {
     assert_eq!(results["budgets"]["processes"], 4, "{results}");
     assert_eq!(results["budgets"]["filesystem_ops"], 100, "{results}");
     assert_eq!(
+        results["budgets"]["llm_cost_micros"], 1_000_000,
+        "the cost budget's default: {results}"
+    );
+    assert_eq!(
         results["commands"],
         serde_json::json!(["echo"]),
         "{results}"

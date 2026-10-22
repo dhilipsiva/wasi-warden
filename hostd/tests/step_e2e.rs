@@ -502,3 +502,172 @@ fn every_capability_call_is_audited() {
     assert_eq!(runs.len(), 1, "one run id");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A `[[llm.providers]]` entry for a provider on `port`.
+fn provider(name: &str, tier: &str, port: u16, input_price: f64, output_price: f64) -> String {
+    format!(
+        "[[llm.providers]]\nname = {name:?}\ntier = {tier:?}\napi_base = \"http://127.0.0.1:{port}/v1\"\napi_key = \"test\"\nmodel = \"{name}-model\"\ninput_price = {input_price:?}\noutput_price = {output_price:?}\n"
+    )
+}
+
+/// A workspace and a config with `providers` (in place of the single `[llm]`) and `extra`.
+fn router_setup(
+    name: &str,
+    providers: &str,
+    extra: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = support::scratch_dir(name);
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let config = root.join("hostd.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "workspace_root = {:?}\n{extra}\n{providers}",
+            workspace.display().to_string()
+        ),
+    )
+    .expect("config");
+    (root, config)
+}
+
+fn list_then_complete() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "status": "continue",
+            "thought": "list",
+            "actions": [{ "capability": "fs.list_dir", "input": {} }]
+        }),
+        serde_json::json!({ "status": "complete", "thought": "done", "actions": [], "reason": "done" }),
+    ]
+}
+
+/// The router tries the local provider first, though the config lists the frontier one first; when
+/// the local one fails, the frontier one answers. Each attempt is a version-1 TelemetryEvent with
+/// its provider, outcome, tokens, cost and latency.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn a_failing_local_endpoint_falls_back_to_the_frontier() {
+    let (local, local_seen) = support::failing_llm(503);
+    let (frontier, frontier_seen) = support::fake_llm_costing(list_then_complete(), 1000);
+    let root = support::scratch_dir("telemetry-root");
+    let telemetry = root.join("telemetry.jsonl");
+    let (run_root, config) = router_setup(
+        "fallback",
+        &format!(
+            "{}{}",
+            provider("frontier", "frontier", frontier, 2.0, 10.0),
+            provider("local", "local", local, 0.0, 0.0)
+        ),
+        &format!(
+            "[telemetry]\npath = {:?}\n",
+            telemetry.display().to_string()
+        ),
+    );
+    let out = support::run_step(&config, "List workspace files");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        *local_seen.lock().unwrap(),
+        2,
+        "local was tried first each round"
+    );
+    assert_eq!(
+        frontier_seen.lock().unwrap().len(),
+        2,
+        "and the frontier answered"
+    );
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&telemetry)
+        .expect("telemetry")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    assert_eq!(events.len(), 4, "{events:?}");
+    for pair in events.chunks(2) {
+        let (tried, answered) = (&pair[0], &pair[1]);
+        assert_eq!(tried["version"], 1);
+        assert_eq!(
+            (tried["provider"].as_str(), tried["ok"].as_bool()),
+            (Some("local"), Some(false))
+        );
+        assert!(
+            tried["error"].as_str().unwrap_or_default().contains("503"),
+            "{tried}"
+        );
+        assert_eq!(answered["provider"], "frontier");
+        assert_eq!(answered["ok"], true);
+        assert_eq!(answered["attempt"], 2);
+        assert!(
+            answered["route_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("local"),
+            "the fallback names what failed: {answered}"
+        );
+        // The fake reports 500 prompt and 500 completion tokens: 500 * 2.0 + 500 * 10.0 micro-units.
+        assert_eq!(answered["cost_micros"], 6000, "{answered}");
+        assert!(answered["latency_ms"].is_u64(), "{answered}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&run_root);
+}
+
+/// A local provider that answers is the only one asked.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn a_working_local_endpoint_answers_alone() {
+    let (local, local_seen) = support::fake_llm(list_then_complete());
+    let (frontier, frontier_seen) = support::fake_llm(list_then_complete());
+    let (root, config) = router_setup(
+        "localfirst",
+        &format!(
+            "{}{}",
+            provider("frontier", "frontier", frontier, 2.0, 10.0),
+            provider("local", "local", local, 0.0, 0.0)
+        ),
+        "",
+    );
+    let out = support::run_step(&config, "List workspace files");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(local_seen.lock().unwrap().len(), 2);
+    assert!(
+        frontier_seen.lock().unwrap().is_empty(),
+        "the frontier was never asked"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Once the cost budget is spent, paid providers are no longer tried: with the free one failing,
+/// the next LLM call is refused and the run stops.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn paid_providers_stop_at_the_cost_budget() {
+    let (local, _local_seen) = support::failing_llm(500);
+    let (frontier, frontier_seen) = support::fake_llm_costing(list_then_complete(), 1000);
+    let (root, config) = router_setup(
+        "costcap",
+        &format!(
+            "{}{}",
+            provider("local", "local", local, 0.0, 0.0),
+            provider("frontier", "frontier", frontier, 2.0, 10.0)
+        ),
+        "[budgets]\nllm_cost_micros = 5000\n",
+    );
+    let out = support::run_step(&config, "List workspace files");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("llm_cost_micros"),
+        "the cost budget is named: {stderr}"
+    );
+    assert_eq!(
+        frontier_seen.lock().unwrap().len(),
+        1,
+        "the first answer cost 6000 of 5000; no paid call after it"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

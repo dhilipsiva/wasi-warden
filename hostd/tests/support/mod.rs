@@ -80,6 +80,35 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<(String, String, St
     Some((method, path, String::from_utf8_lossy(&body).into_owned()))
 }
 
+/// A chat-completions endpoint that fails every request with HTTP `status`; returns its port and
+/// how many requests it saw.
+pub fn failing_llm(status: u16) -> (u16, Arc<Mutex<usize>>) {
+    let seen = Arc::new(Mutex::new(0));
+    let count = Arc::clone(&seen);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let count = Arc::clone(&count);
+            thread::spawn(move || {
+                let mut writer = stream.try_clone().expect("clone stream");
+                let mut reader = BufReader::new(stream);
+                while read_request(&mut reader).is_some() {
+                    *count.lock().expect("count") += 1;
+                    let body = "{\"error\":{\"message\":\"overloaded\"}}";
+                    let _ = write!(
+                        writer,
+                        "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+        }
+    });
+    (port, seen)
+}
+
 fn respond(stream: &mut TcpStream, body: &str) {
     let _ = write!(
         stream,
