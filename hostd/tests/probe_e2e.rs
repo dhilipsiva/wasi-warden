@@ -42,6 +42,11 @@ fn the_wit_capabilities_hold_their_rules() {
     std::fs::write(workspace.join("big.bin"), vec![7u8; 2 << 20]).expect("big file");
     std::fs::write(outside.join("secret.txt"), "secret").expect("secret");
     std::os::unix::fs::symlink(&outside, workspace.join("escape")).expect("symlink");
+    std::fs::create_dir_all(outside.join("sub")).expect("outside/sub");
+    // For the stale-handle swaps: a second link out, and a relative `..` link that stays inside.
+    std::os::unix::fs::symlink(&outside, workspace.join("swap-out")).expect("symlink");
+    std::fs::create_dir_all(workspace.join("a")).expect("a");
+    std::os::unix::fs::symlink("..", workspace.join("a/up")).expect("relative symlink");
     // A program named like an allowed one, planted in the workspace.
     let planted = workspace.join("planted/echo");
     executable(&planted, "#!/bin/sh\necho planted\n");
@@ -98,6 +103,29 @@ fn the_wit_capabilities_hold_their_rules() {
     assert_eq!(
         results["spawn_planted"], "refused",
         "a planted program named like an allowed one"
+    );
+    for key in [
+        "escape_ensure",
+        "escape_metadata",
+        "escape_remove_file",
+        "escape_remove_dir",
+        "escape_rename",
+        "escape_working_dir",
+        "spawn_path",
+        "stale_list",
+        "stale_metadata",
+        "stale_up_list",
+    ] {
+        assert_eq!(results[key], "refused", "{key}: {results}");
+    }
+    assert!(
+        outside.join("secret.txt").exists(),
+        "nothing outside was removed"
+    );
+    assert!(outside.join("sub").exists(), "nor any directory");
+    assert!(
+        !outside.join("stolen.txt").exists(),
+        "and nothing was moved out"
     );
     let timeout = &results["spawn_timeout"];
     assert_eq!(

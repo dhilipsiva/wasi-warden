@@ -146,6 +146,8 @@ pub fn fake_webdriver() -> (u16, Requests) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     let url = Arc::new(Mutex::new(String::from("about:blank")));
+    // A page on `late.example.test` navigates away by itself after it was first looked at.
+    let late_reads = Arc::new(Mutex::new(0u32));
     let port = serve(move |method, path, body| {
         log.lock()
             .expect("log")
@@ -170,7 +172,17 @@ pub fn fake_webdriver() -> (u16, Requests) {
                 }
                 serde_json::Value::Null
             }
-            ("GET", p) if p == session_url => serde_json::json!(*url.lock().expect("url")),
+            ("GET", p) if p == session_url => {
+                let mut current = url.lock().expect("url");
+                if current.contains("late.example.test") {
+                    let mut reads = late_reads.lock().expect("reads");
+                    *reads += 1;
+                    if *reads > 1 {
+                        *current = "http://elsewhere.invalid/".to_string();
+                    }
+                }
+                serde_json::json!(*current)
+            }
             _ => serde_json::Value::Null,
         };
         serde_json::json!({ "value": value }).to_string()
@@ -179,7 +191,7 @@ pub fn fake_webdriver() -> (u16, Requests) {
 }
 
 /// A `hostd.toml` for `workspace`, the LLM on `llm_port`, and a WebDriver on `webdriver_port` that
-/// may visit `login.example.test` and `redirect.example.test`.
+/// may visit `login.example.test`, `redirect.example.test` and `late.example.test`.
 pub fn write_config(path: &Path, workspace: &Path, llm_port: u16, webdriver_port: Option<u16>) {
     let mut config = format!(
         "workspace_root = {:?}\nallow_proc = []\n\n[llm]\napi_base = \"http://127.0.0.1:{llm_port}/v1\"\napi_key = \"test\"\nmodel = \"scripted\"\n",
@@ -187,7 +199,7 @@ pub fn write_config(path: &Path, workspace: &Path, llm_port: u16, webdriver_port
     );
     if let Some(port) = webdriver_port {
         config.push_str(&format!(
-            "\n[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = [\"login.example.test\", \"redirect.example.test\"]\n"
+            "\n[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = [\"login.example.test\", \"redirect.example.test\", \"late.example.test\"]\n"
         ));
     }
     std::fs::write(path, config).expect("config");

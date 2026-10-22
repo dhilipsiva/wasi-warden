@@ -95,13 +95,21 @@ fn navigation_stays_inside_the_host_allowlist() {
     let (llm_port, llm_seen) = support::fake_llm(vec![
         serde_json::json!({
             "status": "continue",
-            "thought": "try four pages",
+            "thought": "try five pages",
             "actions": [
-                { "capability": "browser.open_session", "input": { "alias": "s1" } },
+                {
+                    "capability": "browser.open_session",
+                    "input": { "alias": "s1", "allow_downloads": true }
+                },
                 goto("http://evil.example.test/"),
                 goto("file:///etc/passwd"),
-                goto("http://login.example.test/"),
+                goto("HTTP://LOGIN.example.test"),
                 goto("http://redirect.example.test/"),
+                goto("http://late.example.test/"),
+                {
+                    "capability": "browser.session.describe_page",
+                    "input": { "session": "s1" }
+                },
             ]
         }),
         serde_json::json!({
@@ -133,12 +141,28 @@ fn navigation_stays_inside_the_host_allowlist() {
         "refused URLs never reached the WebDriver: {sent:?}"
     );
     assert!(
-        sent.iter().any(|b| b.contains("login.example.test")),
-        "an allowed host was visited: {sent:?}"
+        sent.iter()
+            .any(|b| b.contains("\"http://login.example.test/\"")),
+        "an allowed host was visited, as the parsed URL: {sent:?}"
+    );
+    let blanks = sent.iter().filter(|b| b.contains("about:blank")).count();
+    assert_eq!(
+        blanks, 2,
+        "the redirect, and the later wandering off the list, were left for about:blank: {sent:?}"
+    );
+    let created = wd
+        .iter()
+        .find(|(m, p, _)| m == "POST" && p == "/session")
+        .map(|(_, _, b)| b.clone())
+        .unwrap_or_default();
+    let workspace_dir = std::fs::canonicalize(&workspace).expect("workspace");
+    let download_pref = format!(
+        "\"download.default_directory\":{:?}",
+        workspace_dir.display().to_string()
     );
     assert!(
-        sent.last().is_some_and(|b| b.contains("about:blank")),
-        "the redirect off the list was left for about:blank: {sent:?}"
+        created.contains(&download_pref),
+        "downloads land in the workspace: {created}"
     );
     let llm = llm_seen.lock().expect("llm log");
     let report: serde_json::Value = serde_json::from_str(&llm[1]).expect("request JSON");
@@ -158,8 +182,8 @@ fn navigation_stays_inside_the_host_allowlist() {
         .collect();
     assert_eq!(
         ok,
-        [true, false, false, true, false],
-        "which gotos succeeded"
+        [true, false, false, true, false, true, false],
+        "which actions succeeded (the last, on a page that wandered off the list)"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

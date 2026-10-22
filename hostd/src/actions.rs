@@ -908,8 +908,8 @@ mod tests {
     fn a_timeout_kills_the_commands_children_too() {
         let root = scratch("group");
         let sh = which("sh");
-        // The child's environment is empty (no PATH), so the script names `sleep` in full.
-        let script = format!("{0} 30 & {0} 30", which("sleep"));
+        // The script names `sleep` in full so it does not depend on the child's PATH.
+        let script = format!("{0} 30 & echo $!; {0} 30", which("sleep"));
         let started = std::time::Instant::now();
         let report = run(
             &root,
@@ -922,6 +922,101 @@ mod tests {
             "the group was killed"
         );
         assert_eq!(report.output["timed_out"], true);
+        assert!(
+            gone(&report.output["stdout"]),
+            "the background child is dead"
+        );
+    }
+
+    /// A command's background children end with it, even ones that dropped their output.
+    #[test]
+    fn a_commands_background_children_end_with_it() {
+        let root = scratch("background");
+        let sh = which("sh");
+        let script = format!("{} 30 >/dev/null 2>&1 & echo $!", which("sleep"));
+        let started = std::time::Instant::now();
+        let report = run(
+            &root,
+            &[sh.as_str()],
+            "proc.spawn",
+            json!({ "command": sh, "args": ["-c", script] }),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.output["status"], 0, "{:?}", report.error);
+        assert!(
+            gone(&report.output["stdout"]),
+            "the background child is dead"
+        );
+    }
+
+    /// The pid printed on the first line of `stdout` names a process that is gone (or a zombie)
+    /// within two seconds.
+    fn gone(stdout: &Value) -> bool {
+        let pid: u32 = stdout
+            .as_str()
+            .and_then(|s| s.lines().next())
+            .and_then(|l| l.trim().parse().ok())
+            .expect("a pid on the first line");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => return true,
+                Ok(stat) => {
+                    let state = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start());
+                    if state.is_some_and(|r| r.starts_with('Z')) {
+                        return true;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Variables that let a plan steer what an allowed program runs (its PATH, shell hooks,
+    /// interpreter search paths) are refused like the loader's.
+    #[test]
+    fn the_plan_cannot_set_path_or_shell_hooks() {
+        let root = scratch("hooks");
+        let env = which("env");
+        for key in [
+            "PATH",
+            "BASH_FUNC_ls%%",
+            "BASH_ENV",
+            "ENV",
+            "GCONV_PATH",
+            "GLIBC_TUNABLES",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+        ] {
+            let report = run(
+                &root,
+                &[env.as_str()],
+                "proc.spawn",
+                json!({ "command": env, "env": [{ "key": key, "value": "x" }] }),
+            );
+            assert!(!report.success, "{key} passed: {:?}", report.output);
+        }
+    }
+
+    #[test]
+    fn a_working_directory_through_a_symlink_out_is_refused() {
+        let root = scratch("cwd");
+        let outside = scratch("cwd-outside");
+        std::os::unix::fs::symlink(outside.as_std_path(), root.join("escape").as_std_path())
+            .unwrap();
+        let pwd = which("pwd");
+        let report = run(
+            &root,
+            &[pwd.as_str()],
+            "proc.spawn",
+            json!({ "command": pwd, "cwd": "escape" }),
+        );
+        assert!(!report.success, "ran in {:?}", report.output["cwd"]);
     }
 
     #[test]

@@ -128,6 +128,28 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
         &spawn_options(&["30"], Vec::new(), Some(200)),
     )
     .and_then(|p| p.wait(None));
+    // Every other way through the symlink out of the workspace.
+    let escape_ensure = fs::ensure_dir(ws, "escape/new");
+    out.insert("escape_ensure".into(), verdict(&escape_ensure));
+    let escape_meta = fs::metadata(ws, Some("escape/secret.txt"));
+    out.insert("escape_metadata".into(), verdict(&escape_meta));
+    let escape_remove = fs::remove_file(ws, "escape/secret.txt");
+    out.insert("escape_remove_file".into(), verdict(&escape_remove));
+    let escape_remove_dir = fs::remove_dir(ws, "escape/sub", true);
+    out.insert("escape_remove_dir".into(), verdict(&escape_remove_dir));
+    let escape_rename = fs::rename(ws, "seed.txt", "escape/stolen.txt");
+    out.insert("escape_rename".into(), verdict(&escape_rename));
+    let mut in_escape = spawn_options(&["x"], Vec::new(), None);
+    in_escape.working_dir = Some("escape".into());
+    let escape_cwd = proc::spawn(&echo, &in_escape);
+    out.insert("escape_working_dir".into(), verdict(&escape_cwd));
+    let path_env = vec![EnvVar {
+        key: "PATH".into(),
+        value: "/tmp".into(),
+    }];
+    let spawn_path = proc::spawn(&echo, &spawn_options(&[], path_env, None));
+    out.insert("spawn_path".into(), verdict(&spawn_path));
+
     out.insert(
         "spawn_timeout".into(),
         json!({
@@ -136,6 +158,36 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
     );
+    // A stale handle: a directory opened, then swapped for a symlink out of the workspace using
+    // only remove and rename (which act on the entry, as they should).
+    let stale = fs::ensure_dir(ws, "h").and_then(|h| {
+        fs::remove_dir(ws, "h", false)?;
+        fs::rename(ws, "swap-out", "h")?;
+        Ok(h)
+    });
+    match stale {
+        Ok(h) => {
+            out.insert("stale_list".into(), verdict(&fs::list_dir(&h)));
+            out.insert("stale_metadata".into(), verdict(&fs::metadata(&h, None)));
+        }
+        Err(e) => {
+            out.insert("stale_setup".into(), json!(e.message));
+        }
+    }
+    // The same with a relative `..` link that pointed inside the workspace until it was moved up.
+    let up = fs::ensure_dir(ws, "h2").and_then(|h| {
+        fs::remove_dir(ws, "h2", false)?;
+        fs::rename(ws, "a/up", "h2")?;
+        Ok(h)
+    });
+    match up {
+        Ok(h) => {
+            out.insert("stale_up_list".into(), verdict(&fs::list_dir(&h)));
+        }
+        Err(e) => {
+            out.insert("stale_up_setup".into(), json!(e.message));
+        }
+    }
     out
 }
 

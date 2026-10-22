@@ -530,6 +530,7 @@ mod tests {
             "DYLD_INSERT_LIBRARIES",
             "",
             "A=B",
+            "A\0B",
         ] {
             assert!(check_env_key(key).is_err(), "{key:?}");
         }
@@ -565,17 +566,48 @@ mod tests {
         assert!(!out.timed_out && !out.stdout_truncated);
     }
 
+    /// Whether the process `pid` is gone (or a zombie) within two seconds.
+    fn gone(pid: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
+                Err(_) => return true,
+                Ok(stat) => {
+                    let state = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start());
+                    if state.is_some_and(|r| r.starts_with('Z')) {
+                        return true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     #[test]
     fn a_child_left_holding_the_output_does_not_hold_the_caller() {
         let started = Instant::now();
-        let out = run_bounded(sh("sleep 30 & echo started"), Duration::from_secs(10)).unwrap();
+        let out = run_bounded(sh("sleep 30 & echo $!"), Duration::from_secs(10)).unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(1),
             "{:?}",
             started.elapsed()
         );
         assert_eq!(out.status, Some(0));
-        assert_eq!(out.stdout, b"started\n");
+        assert!(
+            gone(&String::from_utf8_lossy(&out.stdout)),
+            "and it is dead"
+        );
+    }
+
+    #[test]
+    fn output_exactly_at_the_cap_is_not_truncated() {
+        let exact = run_bounded(sh("head -c 1048576 /dev/zero"), Duration::from_secs(10)).unwrap();
+        assert_eq!(exact.stdout.len(), MAX_OUTPUT_BYTES);
+        assert!(!exact.stdout_truncated);
+        let over = run_bounded(sh("head -c 1048577 /dev/zero"), Duration::from_secs(10)).unwrap();
+        assert_eq!(over.stdout.len(), MAX_OUTPUT_BYTES);
+        assert!(over.stdout_truncated);
     }
 
     // ── Navigation ──────────────────────────────────────────────────────────
