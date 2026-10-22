@@ -345,6 +345,7 @@ fn the_policy_capability_reports_and_enforces_the_budgets() {
         "no grant is configured, so none is approved"
     );
     assert_eq!(results["log_event"], "allowed");
+    assert_eq!(results["fs_paid"], 3, "an open and two writes: {results}");
     assert_eq!(
         results["claim_huge_code"], "limit",
         "a spent budget is a limit: {results}"
@@ -468,6 +469,10 @@ fn a_guest_past_its_memory_budget_is_stopped() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(stderr.contains("guest_memory_bytes"), "{stderr}");
+    assert!(
+        !stderr.contains("wasm backtrace"),
+        "named, not reported as a crash: {stderr}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -523,5 +528,77 @@ fn a_read_only_workspace_refuses_downloads() {
         "{stderr}"
     );
     assert!(stderr.contains("read-only"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A run holds at most four browser sessions at once; closing one makes room for another.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn browser_sessions_are_capped() {
+    let (port, _seen) = support::fake_webdriver();
+    let (root, ws, config) = probe_setup(
+        "sessions",
+        &format!("[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = []\n"),
+    );
+    let results = probe_results(&config, &ws, serde_json::json!({ "mode": "sessions" }));
+    assert_eq!(results["opened"], 4, "{results}");
+    assert_eq!(results["refused"], "limit", "{results}");
+    assert_eq!(results["after_close"], "allowed", "{results}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The LLM capability refuses a call once the token budget is spent, within a round; and the loop
+/// stops before the next round, though the guest never fails.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn the_token_budget_holds_inside_a_round_and_between_rounds() {
+    let done =
+        serde_json::json!({ "status": "complete", "thought": "ok", "actions": [], "reason": "ok" });
+    let (port, _seen) = support::fake_llm_costing(vec![done], 600);
+    let (root, ws, config) = probe_setup(
+        "spend",
+        &format!(
+            "[llm]\napi_base = \"http://127.0.0.1:{port}/v1\"\napi_key = \"test\"\nmodel = \"scripted\"\n[budgets]\nllm_tokens = 10\n"
+        ),
+    );
+    let out = support::run_step_with(&support::probe_component(), &config, r#"{"mode":"spend"}"#);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("token budget"),
+        "the loop stopped: {stderr}"
+    );
+    let results: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ws.join("results.json")).expect("results"))
+            .expect("results are JSON");
+    assert_eq!(results["first"], "allowed", "{results}");
+    assert_eq!(results["second"], "limit", "{results}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A process the agent starts gets no more time than the run has left: it is stopped at the
+/// budget, and the guest then interrupted, rather than the run outlasting it inside the spawn.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn a_process_gets_no_more_than_the_run_has_left() {
+    let sleep = which("sleep");
+    let (root, _ws, config) = probe_setup(
+        "longspawn",
+        &format!("allow_proc = [{sleep:?}]\n[budgets]\nwallclock_ms = 3000\n"),
+    );
+    let task = serde_json::json!({ "mode": "long_spawn", "sleep": sleep });
+    let out = support::run_step_within(
+        &support::probe_component(),
+        &config,
+        &task.to_string(),
+        std::time::Duration::from_secs(60),
+    )
+    .expect("hostd ended the run within 60 s");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("interrupted at the wall-clock budget"),
+        "the guest was interrupted after the process stopped: {stderr}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

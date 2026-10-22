@@ -267,3 +267,31 @@ fn the_token_budget_holds_without_a_usage_report() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The planner's processes get no more time than the run has left, and once the wall-clock budget
+/// is spent the plan's remaining actions are refused.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn actions_stop_at_the_wall_clock_budget() {
+    let (port, _seen) = support::fake_llm(never_completes(serde_json::json!([
+        { "capability": "proc.spawn", "input": { "command": "sleep", "args": ["30"] } },
+        { "capability": "proc.spawn", "input": { "command": "echo", "args": ["late"] } }
+    ])));
+    let (root, config) = setup("wallclock", port, "[budgets]\nwallclock_ms = 3000\n");
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("allow_proc = []", "allow_proc = [\"sleep\", \"echo\"]");
+    std::fs::write(&config, text).unwrap();
+    let out = support::run_step(&config, "Wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        !stderr.contains("inside a host call"),
+        "the process stopped at the budget, before the watchdog: {stderr}"
+    );
+    assert!(
+        stderr.contains("action failed") && stderr.contains("wallclock"),
+        "the next action was refused: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

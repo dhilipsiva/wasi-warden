@@ -2,9 +2,9 @@
 //! the `llm` capability for a plan, this calls the fs and proc capabilities and WASI itself, through
 //! the real bindings, and records what each call returned in `results.json` in the workspace. The
 //! task is a JSON object: `mode` picks what to probe (`rules`, the default; `write_ops`; `policy`;
-//! `browser`; `browser_budget`; `downloads`; `input`; `burn`, which loops forever; `sleep`, which
-//! sleeps `ms` in WASI; or `grow`, which allocates `mib` MiB), and the rest names the programs and
-//! URLs to try.
+//! `browser`; `browser_budget`; `sessions`; `downloads`; `spend`, which asks the LLM twice a round
+//! and plans nothing; `long_spawn`; `input`; `burn`, which loops forever; `sleep`, which sleeps `ms`
+//! in WASI; or `grow`, which allocates `mib` MiB), and the rest names the programs and URLs to try.
 
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,7 @@ use bindings::osagent::browser::browser::{self, Selector, SelectorKind, SessionO
 use bindings::osagent::common::types::{AuditEvent, CapabilityError, CapabilityErrorCode};
 use bindings::osagent::fs::fs::{self, DirHandle, FileOpenOptions};
 use bindings::osagent::input::input;
+use bindings::osagent::llm::llm::{self, Message, Options, Role};
 use bindings::osagent::policy::policy::{self, BudgetKind, GrantRequest};
 use bindings::osagent::proc::proc::{self, EnvVar, SpawnOptions, StdioMode};
 
@@ -134,8 +135,16 @@ fn kind_name(kind: BudgetKind) -> &'static str {
 }
 
 /// The policy capability: the snapshot, budget claims, a grant request and an audit event.
-fn probe_policy() -> Map<String, Value> {
+fn probe_policy(ws: &DirHandle) -> Map<String, Value> {
     let mut out = Map::new();
+    // Each fs call is paid for: an open and two writes, three operations.
+    let used = || policy::claim_budget(BudgetKind::FilesystemOps, 0).map_or(0, |b| b.used);
+    let before = used();
+    let _ = fs::open_file(ws, "paid.txt", write_only()).and_then(|f| {
+        f.write_string("x", false)?;
+        f.write(b"y")
+    });
+    out.insert("fs_paid".into(), json!(used() - before));
     match policy::describe() {
         Ok(snapshot) => {
             let budgets: Map<String, Value> = snapshot
@@ -299,6 +308,54 @@ fn probe_browser_budget(task: &Value) -> Map<String, Value> {
     out
 }
 
+/// Sessions until the host refuses one, then one more after closing one.
+fn probe_sessions() -> Map<String, Value> {
+    let options = SessionOptions {
+        profile: None,
+        headless: true,
+        allow_downloads: false,
+    };
+    let mut out = Map::new();
+    let mut open = Vec::new();
+    let mut last = json!("allowed");
+    for _ in 0..10 {
+        match browser::open_session(&options) {
+            Ok(s) => open.push(s),
+            Err(e) => {
+                last = budgeted::<()>(&Err(e));
+                break;
+            }
+        }
+    }
+    out.insert("opened".into(), json!(open.len()));
+    out.insert("refused".into(), last);
+    if let Some(first) = open.pop() {
+        first.close();
+        drop(first);
+        let again = browser::open_session(&options);
+        out.insert("after_close".into(), budgeted(&again));
+    }
+    out
+}
+
+/// What the LLM capability answers, as "allowed", "limit" or "refused: <why>".
+fn ask_llm() -> Value {
+    let options = Options {
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        stop: Vec::new(),
+        presence_penalty: None,
+        frequency_penalty: None,
+    };
+    let message = Message {
+        role: Role::User,
+        content: "plan".into(),
+        name: None,
+    };
+    budgeted(&llm::complete(&[message], &options))
+}
+
 /// A session that asks for downloads. Its workspace is read-only in the test, so the outcome comes
 /// back as the step's error rather than in `results.json`.
 fn probe_downloads() -> Map<String, Value> {
@@ -375,7 +432,16 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
     let task: Value = serde_json::from_str(task).unwrap_or_default();
     match task["mode"].as_str().unwrap_or("rules") {
         "write_ops" => return probe_writes(ws),
-        "policy" => return probe_policy(),
+        "policy" => return probe_policy(ws),
+        "sessions" => return probe_sessions(),
+        "long_spawn" => {
+            // A process that would outlast the run: its timeout is the wall-clock time left.
+            let sleep = task["sleep"].as_str().unwrap_or_default().to_string();
+            let mut out = Map::new();
+            let ran = proc::spawn(&sleep, &spawn_options(&["30"], Vec::new(), None));
+            out.insert("spawn".into(), outcome(&ran));
+            return out;
+        }
         "browser" => return probe_browser(&task),
         "browser_budget" => return probe_browser_budget(&task),
         "sleep" => {
@@ -571,6 +637,20 @@ impl planner::Guest for Probe {
             return Err(fail(Value::Object(probe_downloads()).to_string()));
         }
         let ws = fs::open_workspace().map_err(|e| fail(e.message))?;
+        if task.contains("\"spend\"") {
+            // Twice a round: the second call is past the budget the first one spent.
+            let asked = json!({ "first": ask_llm(), "second": ask_llm() }).to_string();
+            let file =
+                fs::open_file(&ws, "results.json", write_only()).map_err(|e| fail(e.message))?;
+            file.write_string(&asked, false)
+                .map_err(|e| fail(e.message))?;
+            file.close();
+            ws.close();
+            return Ok(StepResponse::Continue(planner::ContinuePlan {
+                thought: "spent".into(),
+                actions: Vec::new(),
+            }));
+        }
         let results = Value::Object(probe(&task, &ws)).to_string();
         let options = FileOpenOptions {
             read: false,
