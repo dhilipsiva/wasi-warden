@@ -151,6 +151,9 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
     out.insert("escape_remove_dir".into(), verdict(&escape_remove_dir));
     let escape_rename = fs::rename(ws, "seed.txt", "escape/stolen.txt");
     out.insert("escape_rename".into(), verdict(&escape_rename));
+    // And the other way: an entry outside moved in.
+    let rename_in = fs::rename(ws, "../outside/secret.txt", "stolen-in.txt");
+    out.insert("escape_rename_in".into(), verdict(&rename_in));
     let mut in_escape = spawn_options(&["x"], Vec::new(), None);
     in_escape.working_dir = Some("escape".into());
     let escape_cwd = proc::spawn(&echo, &in_escape);

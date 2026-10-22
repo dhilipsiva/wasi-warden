@@ -121,6 +121,7 @@ fn the_wit_capabilities_hold_their_rules() {
         "escape_remove_file",
         "escape_remove_dir",
         "escape_rename",
+        "escape_rename_in",
         "escape_working_dir",
         "spawn_path",
         "stale_list",

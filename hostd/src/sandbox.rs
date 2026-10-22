@@ -650,6 +650,21 @@ mod tests {
             resolve_allowed("tool", Some(&relative), &ws).is_err(),
             "a relative PATH entry"
         );
+        // A relative entry that does resolve from this process's directory to a real program
+        // outside the workspace is still not searched.
+        let tools = scratch("relative-tools");
+        fs::write(tools.join("tool"), "#!/bin/sh\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count().saturating_sub(1));
+        let relative = OsString::from(format!("{up}{}", tools.as_str().trim_start_matches('/')));
+        assert!(
+            Path::new(&relative).join("tool").is_file(),
+            "the relative entry does resolve"
+        );
+        assert!(
+            resolve_allowed("tool", Some(&relative), &elsewhere()).is_err(),
+            "but relative entries are never searched"
+        );
     }
 
     #[test]
@@ -671,10 +686,21 @@ mod tests {
 
     #[test]
     fn the_plan_sets_only_allowed_variables_and_never_dangerous_ones() {
-        let allowed: Vec<String> = ["HOME", "RUST_LOG", "PATH", "LD_PRELOAD", "BASH_FUNC_ls%%"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let allowed: Vec<String> = [
+            "HOME",
+            "RUST_LOG",
+            "PATH",
+            "LD_PRELOAD",
+            "BASH_FUNC_ls%%",
+            "PYTHONUSERBASE",
+            "PERLLIB",
+            "RUBYLIB",
+            "NODE_PATH",
+            "BASHOPTS",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         for key in ["HOME", "RUST_LOG"] {
             assert!(check_env_key(key, &allowed).is_ok(), "{key}");
         }
@@ -689,6 +715,11 @@ mod tests {
             "GCONV_PATH",
             "GIT_CONFIG_COUNT",
             "GIT_SSH_COMMAND",
+            "PYTHONUSERBASE",
+            "PERLLIB",
+            "RUBYLIB",
+            "NODE_PATH",
+            "BASHOPTS",
             "",
             "A=B",
             "A\0B",

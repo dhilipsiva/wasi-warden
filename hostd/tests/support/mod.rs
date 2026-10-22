@@ -145,7 +145,8 @@ pub const SESSION: &str = "fake-session-1";
 pub fn fake_webdriver() -> (u16, Requests) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
-    let url = Arc::new(Mutex::new(String::from("about:blank")));
+    // chromedriver starts a session on `data:,`.
+    let url = Arc::new(Mutex::new(String::from("data:,")));
     // A page on `late.example.test` navigates away by itself after it was first looked at.
     let late_reads = Arc::new(Mutex::new(0u32));
     let port = serve(move |method, path, body| {
