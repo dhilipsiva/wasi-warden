@@ -76,6 +76,9 @@ fn outcome<T>(r: &Result<T, bindings::osagent::common::types::CapabilityError>) 
 /// Every kind of write, for the workspace rules (`read_only`, `max_file_bytes`).
 fn probe_writes(ws: &DirHandle) -> Map<String, Value> {
     let mut out = Map::new();
+    // Read first: the rename below moves this file.
+    let read = fs::open_file(ws, "seed.txt", read_only()).and_then(|f| f.read_to_string(64));
+    out.insert("read".into(), json!(read.unwrap_or_else(|e| e.message)));
     out.insert("ensure_dir".into(), outcome(&fs::ensure_dir(ws, "new-dir")));
     let small =
         fs::open_file(ws, "small.txt", write_only()).and_then(|f| f.write_string("ok", false));
@@ -87,8 +90,6 @@ fn probe_writes(ws: &DirHandle) -> Map<String, Value> {
         outcome(&fs::rename(ws, "seed.txt", "moved.txt")),
     );
     out.insert("remove".into(), outcome(&fs::remove_file(ws, "other.txt")));
-    let read = fs::open_file(ws, "seed.txt", read_only()).and_then(|f| f.read_to_string(64));
-    out.insert("read".into(), json!(read.unwrap_or_else(|e| e.message)));
     out
 }
 
