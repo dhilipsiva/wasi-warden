@@ -6,12 +6,16 @@ use camino::Utf8PathBuf;
 use serde::Deserialize;
 
 use crate::cli::StepArgs;
+use crate::sandbox::{self, AllowedProgram};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub workspace_root: Utf8PathBuf,
+    /// The allowlist as configured (file and command line merged), by name.
     pub allowed_proc_commands: Vec<String>,
+    /// The allowlist resolved when the config loaded: what each entry runs as.
+    pub allowed_programs: Vec<AllowedProgram>,
     pub llm: Option<LlmSettings>,
     pub browser: Option<BrowserSettings>,
 }
@@ -27,6 +31,10 @@ pub struct LlmSettings {
 pub struct BrowserSettings {
     pub webdriver_url: String,
     pub default_profile: Option<String>,
+    /// The hosts the browser may visit (`*.example.com` for subdomains). Empty allows nothing.
+    pub allowed_hosts: Vec<String>,
+    /// Launch Chrome with `--no-sandbox` (only for hosts where its sandbox cannot run). Off by default.
+    pub chrome_no_sandbox: bool,
 }
 
 impl HostConfig {
@@ -47,6 +55,12 @@ impl HostConfig {
         allowed_proc_commands.extend(args.allow_proc.iter().cloned());
         allowed_proc_commands.sort();
         allowed_proc_commands.dedup();
+        let path_var = std::env::var_os("PATH");
+        let allowed_programs = allowed_proc_commands
+            .iter()
+            .map(|entry| sandbox::resolve_allowed(entry, path_var.as_deref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::msg)?;
         let llm = match file_cfg.llm {
             Some(cfg) => cfg.into_settings()?,
             None => None,
@@ -58,22 +72,15 @@ impl HostConfig {
         Ok(Self {
             workspace_root,
             allowed_proc_commands,
+            allowed_programs,
             llm,
             browser,
         })
     }
 
-    pub fn is_proc_allowed(&self, program: &str) -> bool {
-        if self.allowed_proc_commands.is_empty() {
-            return false;
-        }
-        let base = Path::new(program)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(program);
-        self.allowed_proc_commands
-            .iter()
-            .any(|entry| entry == program || entry == base)
+    /// What `requested` runs as, if the allowlist admits it ([`sandbox::admit`]).
+    pub fn program_for(&self, requested: &str) -> Option<&Path> {
+        sandbox::admit(&self.allowed_programs, requested)
     }
 }
 
@@ -143,6 +150,8 @@ fn normalize_path(path: &Path) -> Result<Utf8PathBuf> {
 struct BrowserFileSettings {
     webdriver_url: Option<String>,
     default_profile: Option<String>,
+    allowed_hosts: Option<Vec<String>>,
+    chrome_no_sandbox: Option<bool>,
 }
 
 impl BrowserFileSettings {
@@ -154,6 +163,8 @@ impl BrowserFileSettings {
         Ok(Some(BrowserSettings {
             webdriver_url: url,
             default_profile: self.default_profile.filter(|p| !p.trim().is_empty()),
+            allowed_hosts: self.allowed_hosts.unwrap_or_default(),
+            chrome_no_sandbox: self.chrome_no_sandbox.unwrap_or(false),
         }))
     }
 }
@@ -269,7 +280,29 @@ mod tests {
     #[test]
     fn an_empty_allowlist_allows_nothing() {
         let cfg = HostConfig::from_step_args(&args(Path::new("/nonexistent/hostd.toml"))).unwrap();
-        assert!(!cfg.is_proc_allowed("ls"));
-        assert!(!cfg.is_proc_allowed(""));
+        assert!(cfg.program_for("ls").is_none());
+        assert!(cfg.program_for("").is_none());
+    }
+
+    #[test]
+    fn the_allowlist_resolves_at_load_and_a_missing_program_is_an_error() {
+        let cfg = HostConfig::from_step_args(&args(&write("resolve", "allow_proc = [\"echo\"]\n")))
+            .unwrap();
+        let echo = cfg.program_for("echo").expect("echo resolves");
+        assert!(echo.is_absolute(), "{}", echo.display());
+        let missing = write("missing", "allow_proc = [\"no-such-program-xyz\"]\n");
+        assert!(HostConfig::from_step_args(&args(&missing)).is_err());
+    }
+
+    #[test]
+    fn the_browser_allows_no_host_and_keeps_its_sandbox_by_default() {
+        let cfg = HostConfig::from_step_args(&args(&write(
+            "browserdefaults",
+            "[browser]\nwebdriver_url = \"http://127.0.0.1:9515\"\n",
+        )))
+        .unwrap();
+        let browser = cfg.browser.unwrap();
+        assert!(browser.allowed_hosts.is_empty());
+        assert!(!browser.chrome_no_sandbox);
     }
 }

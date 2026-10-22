@@ -135,9 +135,11 @@ What does not work yet:
   audit log. The `policy` capability and every `input` call return `Denied`.
 * **The sandbox isolates only prompt-building code**: the planning happens in the LLM and the actions run in the
   native host, outside the sandbox.
-* **Known security gaps**: the workspace check is a lexical path prefix (symlinks can escape it), the process
-  allowlist matches a command's base name, environment variables from the plan are passed through, and
-  Chrome runs with `--no-sandbox`.
+* **The host's rules have known limits** (both the planner's actions and the WIT capabilities follow them):
+  * paths are checked component by component through symlinks, but the check and the use are separate calls,
+    so a process swapping a directory for a symlink in between could still escape;
+  * the browser's `goto` is confined to `allowed_hosts` and a redirect off them is abandoned, but a link the
+    page clicks through to is not intercepted.
 
 Expect breaking changes. The progress snapshot is in [docs/status.md](docs/status.md).
 
@@ -208,6 +210,8 @@ To try browser tasks, point the host at a running WebDriver (Chromedriver, Gecko
 [browser]
 webdriver_url = "http://127.0.0.1:9515"
 default_profile = "default"
+# The hosts the browser may visit (`*.example.com` for subdomains); none when unset.
+allowed_hosts = ["demo.example"]
 ```
 
 Each browser action in planner JSON must assign an `alias` for new sessions/elements so follow-up actions (click/type/etc.) can reference them. See [docs/browser-login-task.md](docs/browser-login-task.md) for a worked example.
@@ -235,8 +239,22 @@ The design's rules:
 
   * Every capability call is logged with inputs, outputs, and task ID.
 
-**Today nothing beyond the round cap (`MAX_HOST_STEPS`, 8) is enforced**: there are no runtime, fuel or token
-limits and no audit log, and the gaps listed under [Status](#status) apply. Whatever the planner reads, a
+**Enforced today:**
+
+* **Paths.** They stay inside the workspace: no absolute paths, no `..`, and no symlink out of it, dangling
+  ones included.
+* **Programs.** A program runs only as `allow_proc` resolved it when the config loaded: a bare name through
+  `PATH`, or an absolute path. A program planted elsewhere under an allowed name does not run.
+* **Environment.** The plan cannot set `LD_*` or `DYLD_*` variables.
+* **Process limits.** A process gets 30 s unless the plan asks for less (300 s at most). A timeout kills its
+  whole process group, and each output stream is capped at 1 MiB.
+* **Reads.** A read returns at most 1 MiB.
+* **Browser.** It visits only `allowed_hosts` over http(s), and Chrome keeps its sandbox unless
+  `chrome_no_sandbox` is set.
+* **Rounds.** The loop stops after 8 rounds (`MAX_HOST_STEPS`).
+
+**Not enforced yet:** fuel, wall-clock and token budgets, and an audit log. The limits listed under
+[Status](#status) apply. Whatever the planner reads, a
 secrets file included, is sent to the configured LLM provider, so with a cloud model it leaves the machine.
 
 ---

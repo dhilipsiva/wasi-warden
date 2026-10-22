@@ -16,6 +16,7 @@ mod cli;
 mod config;
 mod logging;
 mod runtime;
+mod sandbox;
 mod state;
 
 use anyhow::Result;

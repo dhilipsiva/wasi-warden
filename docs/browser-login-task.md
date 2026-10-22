@@ -12,6 +12,7 @@ This walkthrough shows how to use the existing WIT contracts to automate a “si
   [browser]
   webdriver_url = "http://127.0.0.1:9515" # chromedriver/geckodriver/etc.
   default_profile = "default"
+  allowed_hosts = ["demo.example"]        # the only hosts the session may visit
   ```
 
 - Workspace should contain the credential material the planner is allowed to read, e.g. `secrets/demo-login.json`.

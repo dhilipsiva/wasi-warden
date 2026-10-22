@@ -5,7 +5,8 @@
 # The directory the fs capability is confined to (overridden by --workspace).
 workspace_root = "./sandbox"
 
-# Commands the proc capability may run (more with --allow-proc).
+# Programs the proc capability may run (more with --allow-proc): bare names, resolved through PATH when
+# hostd starts, or absolute paths. A program missing here is a configuration error.
 allow_proc = ["ls", "echo"]
 
 # Any OpenAI-compatible chat-completions endpoint. This one is a local Ollama.
@@ -18,3 +19,7 @@ model = "phi3.5"
 # [browser]
 # webdriver_url = "http://127.0.0.1:9515"
 # default_profile = "default"
+# The hosts the browser may visit over http(s), `*.example.com` for subdomains; none when unset.
+# allowed_hosts = ["demo.example"]
+# Launch Chrome without its sandbox, only where the sandbox cannot run (some containers).
+# chrome_no_sandbox = false

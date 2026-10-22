@@ -877,6 +877,7 @@ dependencies = [
  "base64 0.22.1",
  "camino",
  "clap",
+ "rustix",
  "serde",
  "serde_json",
  "thirtyfour",
@@ -885,6 +886,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "wasmtime",
  "wasmtime-wasi",
 ]

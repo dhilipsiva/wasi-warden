@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Take};
-use std::path::{Component, Path};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as Base64};
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thirtyfour::prelude::*;
@@ -15,6 +14,7 @@ use tokio::runtime::Handle;
 
 use crate::bindings::exports::osagent::agent::planner::PlannedAction;
 use crate::config::{BrowserSettings, HostConfig};
+use crate::sandbox;
 
 #[derive(Debug, Serialize)]
 pub struct ActionReport {
@@ -149,7 +149,7 @@ impl ActionExecutor {
             if path.trim().is_empty() {
                 self.config.workspace_root.clone()
             } else {
-                resolve_workspace_child(&self.config.workspace_root, &path)?
+                self.confine(&path)?
             }
         } else {
             self.config.workspace_root.clone()
@@ -181,8 +181,9 @@ impl ActionExecutor {
         if params.path.trim().is_empty() {
             bail!("fs.read_file requires a non-empty `path`");
         }
-        let target = resolve_workspace_child(&self.config.workspace_root, &params.path)?;
-        let limit = params.max_bytes.unwrap_or(4096);
+        let target = self.confine(&params.path)?;
+        // Capped, so `limit + 1` below cannot overflow.
+        let limit = sandbox::cap_read(params.max_bytes.unwrap_or(4096));
         let mut file = std::fs::File::open(target.as_std_path())
             .with_context(|| format!("failed to open file {}", target))?;
         let mut reader: Take<&mut std::fs::File> = (&mut file).take(limit + 1);
@@ -208,21 +209,27 @@ impl ActionExecutor {
         if params.command.trim().is_empty() {
             bail!("proc.spawn requires `command`");
         }
-        if !self.config.is_proc_allowed(&params.command) {
+        let Some(program) = self.config.program_for(&params.command) else {
             bail!("command `{}` is not allowed by policy", params.command);
+        };
+        if let Some(env) = &params.env {
+            for var in env {
+                sandbox::check_env_key(&var.key).map_err(anyhow::Error::msg)?;
+            }
         }
 
         let working_dir = if let Some(cwd) = params.cwd {
             if cwd.trim().is_empty() {
                 self.config.workspace_root.clone()
             } else {
-                resolve_workspace_child(&self.config.workspace_root, &cwd)?
+                self.confine(&cwd)?
             }
         } else {
             self.config.workspace_root.clone()
         };
 
-        let mut cmd = Command::new(&params.command);
+        // The allowlist's resolved program, never a PATH lookup of the plan's string.
+        let mut cmd = Command::new(program);
         cmd.args(&params.args);
         cmd.current_dir(working_dir.as_std_path());
         cmd.env_clear();
@@ -232,18 +239,18 @@ impl ActionExecutor {
             }
         }
 
-        let output = cmd
-            .output()
+        let output = sandbox::run_bounded(cmd, sandbox::proc_timeout(params.timeout_ms))
             .with_context(|| format!("failed to execute {}", params.command))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         Ok(json!({
             "command": params.command,
             "args": params.args,
             "cwd": working_dir.as_str(),
-            "status": output.status.code(),
-            "stdout": stdout,
-            "stderr": stderr,
+            "status": output.status,
+            "timed_out": output.timed_out,
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+            "stdout_truncated": output.stdout_truncated,
+            "stderr_truncated": output.stderr_truncated,
         }))
     }
 
@@ -257,6 +264,7 @@ impl ActionExecutor {
         let headless = params.headless.unwrap_or(true);
         let profile = params.profile.or_else(|| settings.default_profile.clone());
         let allow_downloads = params.allow_downloads.unwrap_or(false);
+        let no_sandbox = settings.chrome_no_sandbox;
         let handle = self.tokio.clone();
         let driver = handle.block_on(async move {
             let mut caps = DesiredCapabilities::chrome();
@@ -265,7 +273,9 @@ impl ActionExecutor {
                 caps.add_arg("--disable-gpu")?;
             }
             caps.add_arg("--disable-dev-shm-usage")?;
-            caps.add_arg("--no-sandbox")?;
+            if no_sandbox {
+                caps.add_arg("--no-sandbox")?;
+            }
             if allow_downloads {
                 let prefs = serde_json::json!({
                     "download.prompt_for_download": false,
@@ -283,6 +293,8 @@ impl ActionExecutor {
     fn browser_session_goto(&self, params: BrowserGotoInput) -> Result<Value> {
         let alias = normalized_alias(&params.session)?;
         let driver = self.session_driver(&alias)?;
+        let allowed = &self.browser_settings()?.allowed_hosts;
+        sandbox::check_navigation(&params.url, allowed).map_err(anyhow::Error::msg)?;
         let url = params.url.clone();
         let timeout = params.timeout_ms.unwrap_or(5_000);
         self.tokio.block_on({
@@ -297,6 +309,14 @@ impl ActionExecutor {
             let driver = driver.clone();
             async move { driver.current_url().await.map(|u| u.to_string()) }
         })?;
+        // A page may redirect anywhere; one that left the allowed hosts is abandoned.
+        if let Err(why) = sandbox::check_navigation(&current_url, allowed) {
+            self.tokio.block_on({
+                let driver = driver.clone();
+                async move { driver.goto("about:blank").await }
+            })?;
+            bail!("the page redirected off the allowed hosts ({why}); left for about:blank");
+        }
         Ok(json!({
             "session": alias,
             "url": current_url,
@@ -399,6 +419,12 @@ impl ActionExecutor {
         }))
     }
 
+    /// `relative` under the workspace root ([`sandbox::confine`]).
+    fn confine(&self, relative: &str) -> Result<Utf8PathBuf> {
+        let root = &self.config.workspace_root;
+        Ok(sandbox::confine(root, root, relative)?)
+    }
+
     fn browser_settings(&self) -> Result<&BrowserSettings> {
         self.config
             .browser
@@ -450,6 +476,8 @@ struct ProcSpawnInput {
     args: Vec<String>,
     cwd: Option<String>,
     env: Option<Vec<ProcEnvVar>>,
+    /// Capped by the host ([`sandbox::proc_timeout`]); the default applies when unset.
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -545,36 +573,6 @@ fn selector_to_by(selector: &BrowserSelector) -> Result<By> {
     }
 }
 
-fn resolve_workspace_child(root: &Utf8Path, relative: &str) -> Result<Utf8PathBuf> {
-    if relative.is_empty() {
-        return Ok(root.to_path_buf());
-    }
-    let rel_path = Path::new(relative);
-    if rel_path.is_absolute() {
-        bail!("absolute paths are not allowed");
-    }
-    let mut candidate = root.as_std_path().to_path_buf();
-    for component in rel_path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(seg) => candidate.push(seg),
-            _ => bail!("path traversal segments are not allowed"),
-        }
-    }
-    let candidate =
-        Utf8PathBuf::from_path_buf(candidate).map_err(|_| anyhow!("path is not valid UTF-8"))?;
-    ensure_within_workspace(root, &candidate)?;
-    Ok(candidate)
-}
-
-fn ensure_within_workspace(root: &Utf8Path, candidate: &Utf8Path) -> Result<()> {
-    if candidate.as_std_path().starts_with(root.as_std_path()) {
-        Ok(())
-    } else {
-        bail!("path `{}` escapes workspace root", candidate)
-    }
-}
-
 fn entry_kind(meta: &fs::Metadata) -> &'static str {
     if meta.is_file() {
         "file"
@@ -597,6 +595,7 @@ fn file_time_ms(meta: &fs::Metadata) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8Path;
 
     /// A fresh directory under the system temp directory, canonicalised (as the host resolves the
     /// workspace root).
@@ -613,9 +612,14 @@ mod tests {
     }
 
     fn config(root: &Utf8Path, allow_proc: &[&str]) -> HostConfig {
+        let path_var = std::env::var_os("PATH");
         HostConfig {
             workspace_root: root.to_path_buf(),
             allowed_proc_commands: allow_proc.iter().map(|s| s.to_string()).collect(),
+            allowed_programs: allow_proc
+                .iter()
+                .map(|s| sandbox::resolve_allowed(s, path_var.as_deref()).expect("resolves"))
+                .collect(),
             llm: None,
             browser: None,
         }
@@ -633,53 +637,7 @@ mod tests {
         executor.execute(&[action]).remove(0)
     }
 
-    // ── Workspace path resolution ───────────────────────────────────────────
-
-    #[test]
-    fn an_empty_path_is_the_workspace_root() {
-        let root = Utf8Path::new("/work/sandbox");
-        assert_eq!(resolve_workspace_child(root, "").unwrap(), root);
-    }
-
-    #[test]
-    fn a_relative_path_resolves_under_the_root() {
-        let root = Utf8Path::new("/work/sandbox");
-        assert_eq!(
-            resolve_workspace_child(root, "src/main.rs").unwrap(),
-            Utf8Path::new("/work/sandbox/src/main.rs")
-        );
-    }
-
-    #[test]
-    fn current_directory_segments_are_dropped() {
-        let root = Utf8Path::new("/work/sandbox");
-        assert_eq!(
-            resolve_workspace_child(root, "./a/./b").unwrap(),
-            Utf8Path::new("/work/sandbox/a/b")
-        );
-    }
-
-    #[test]
-    fn a_parent_segment_is_refused() {
-        let root = Utf8Path::new("/work/sandbox");
-        for path in ["../etc/passwd", "a/../../etc", "a/.."] {
-            assert!(resolve_workspace_child(root, path).is_err(), "{path}");
-        }
-    }
-
-    #[test]
-    fn an_absolute_path_is_refused() {
-        let root = Utf8Path::new("/work/sandbox");
-        assert!(resolve_workspace_child(root, "/etc/passwd").is_err());
-    }
-
-    /// `/work/sandbox2` shares a string prefix with `/work/sandbox` but is not inside it.
-    #[test]
-    fn a_sibling_sharing_the_roots_prefix_is_outside() {
-        let root = Utf8Path::new("/work/sandbox");
-        assert!(ensure_within_workspace(root, Utf8Path::new("/work/sandbox2/secret")).is_err());
-        assert!(ensure_within_workspace(root, Utf8Path::new("/work/sandbox/inner")).is_ok());
-    }
+    // ── Workspace paths (the rules themselves are tested in sandbox.rs) ──────
 
     /// A symlink inside the workspace that points out of it is not followed.
     #[test]
@@ -950,12 +908,14 @@ mod tests {
     fn a_timeout_kills_the_commands_children_too() {
         let root = scratch("group");
         let sh = which("sh");
+        // The child's environment is empty (no PATH), so the script names `sleep` in full.
+        let script = format!("{0} 30 & {0} 30", which("sleep"));
         let started = std::time::Instant::now();
         let report = run(
             &root,
             &[sh.as_str()],
             "proc.spawn",
-            json!({ "command": sh, "args": ["-c", "sleep 30 & sleep 30"], "timeout_ms": 200 }),
+            json!({ "command": sh, "args": ["-c", script], "timeout_ms": 200 }),
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),

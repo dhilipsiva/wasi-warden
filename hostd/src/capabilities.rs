@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Component, Path};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -13,6 +13,7 @@ use wasmtime::component::{Resource, ResourceTableError};
 use crate::bindings;
 use crate::config::{HostConfig, LlmSettings};
 use crate::resources::{DirHandleResource, FileHandleResource, ProcessResource};
+use crate::sandbox;
 use crate::state::HostState;
 use bindings::osagent::llm::llm::Role as MessageRole;
 
@@ -270,37 +271,33 @@ fn io_error(op: &str, err: std::io::Error) -> CapabilityError {
     capability_error(code, format!("{op} failed: {err}"))
 }
 
-fn resolve_child(parent: &Utf8Path, relative: &str) -> Result<Utf8PathBuf, CapabilityError> {
-    let rel_path = Path::new(relative);
-    if rel_path.is_absolute() {
-        return Err(capability_error(
-            CapabilityErrorCode::InvalidArgument,
-            "absolute paths are not allowed",
-        ));
-    }
-
-    let mut result = parent.as_std_path().to_path_buf();
-    for component in rel_path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => {
-                return Err(capability_error(
-                    CapabilityErrorCode::InvalidArgument,
-                    "absolute paths are not allowed",
-                ));
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(capability_error(
-                    CapabilityErrorCode::InvalidArgument,
-                    "parent segments are not allowed",
-                ));
-            }
-            Component::Normal(seg) => result.push(seg),
+fn path_error(err: sandbox::PathError) -> CapabilityError {
+    let code = match err {
+        sandbox::PathError::Escapes(_) | sandbox::PathError::Dangling(_) => {
+            CapabilityErrorCode::Denied
         }
-    }
+        sandbox::PathError::Io(_) => CapabilityErrorCode::Internal,
+        _ => CapabilityErrorCode::InvalidArgument,
+    };
+    capability_error(code, err.to_string())
+}
 
-    Utf8PathBuf::from_path_buf(result)
-        .map_err(|_| capability_error(CapabilityErrorCode::InvalidArgument, "path is not UTF-8"))
+/// `relative` under the handle's directory `parent`, confined to the workspace ([`sandbox::confine`]).
+fn confined(
+    state: &HostState,
+    parent: &Utf8Path,
+    relative: &str,
+) -> Result<Utf8PathBuf, CapabilityError> {
+    sandbox::confine(&state.config.workspace_root, parent, relative).map_err(path_error)
+}
+
+/// Like [`confined`], without following the last component (for removing and renaming entries).
+fn confined_entry(
+    state: &HostState,
+    parent: &Utf8Path,
+    relative: &str,
+) -> Result<Utf8PathBuf, CapabilityError> {
+    sandbox::confine_entry(&state.config.workspace_root, parent, relative).map_err(path_error)
 }
 
 fn dir_path<'a>(
@@ -401,17 +398,6 @@ fn file_time_ms(meta: &fs::Metadata) -> Option<u64> {
         .map(|dur| dur.as_millis() as u64)
 }
 
-fn ensure_within_workspace(root: &Utf8Path, candidate: &Utf8Path) -> Result<(), CapabilityError> {
-    if candidate.as_str().starts_with(root.as_str()) {
-        Ok(())
-    } else {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "path escapes workspace root",
-        ))
-    }
-}
-
 fn read_file_bytes(
     state: &mut HostState,
     handle: &Resource<FileHandle>,
@@ -419,7 +405,7 @@ fn read_file_bytes(
     op: &str,
 ) -> Result<Vec<u8>, CapabilityError> {
     let entry = file_entry_mut(state, handle)?;
-    let mut reader = (&mut entry.file).take(max_bytes);
+    let mut reader = (&mut entry.file).take(sandbox::cap_read(max_bytes));
     let mut buf = Vec::new();
     reader
         .read_to_end(&mut buf)
@@ -439,17 +425,6 @@ fn write_file_bytes(
         .write(data)
         .map(|written| written as u64)
         .map_err(|err| io_error(op, err))
-}
-
-fn ensure_command_allowed(config: &HostConfig, program: &str) -> Result<(), CapabilityError> {
-    if config.is_proc_allowed(program) {
-        Ok(())
-    } else {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            format!("command `{program}` is not allowed"),
-        ))
-    }
 }
 
 fn to_exit_status(resource: &ProcessResource) -> bindings::osagent::proc::proc::ExitStatus {
@@ -491,8 +466,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
         relative_path: String,
     ) -> Result<Resource<DirHandle>, CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
-        let candidate = resolve_child(&parent_path, &relative_path)?;
-        ensure_within_workspace(&self.config.workspace_root, &candidate)?;
+        let candidate = confined(self, &parent_path, &relative_path)?;
         let metadata =
             fs::metadata(candidate.as_std_path()).map_err(|err| io_error("fs.open-dir", err))?;
         if !metadata.is_dir() {
@@ -510,8 +484,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
         relative_path: String,
     ) -> Result<Resource<DirHandle>, CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
-        let candidate = resolve_child(&parent_path, &relative_path)?;
-        ensure_within_workspace(&self.config.workspace_root, &candidate)?;
+        let candidate = confined(self, &parent_path, &relative_path)?;
         fs::create_dir_all(candidate.as_std_path())
             .map_err(|err| io_error("fs.ensure-dir", err))?;
         insert_dir(self, candidate)
@@ -524,8 +497,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
         recursive: bool,
     ) -> Result<(), CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
-        let target = resolve_child(&parent_path, &relative_path)?;
-        ensure_within_workspace(&self.config.workspace_root, &target)?;
+        let target = confined_entry(self, &parent_path, &relative_path)?;
         if recursive {
             fs::remove_dir_all(target.as_std_path()).map_err(|err| io_error("fs.remove-dir", err))
         } else {
@@ -539,8 +511,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
         relative_path: String,
     ) -> Result<(), CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
-        let target = resolve_child(&parent_path, &relative_path)?;
-        ensure_within_workspace(&self.config.workspace_root, &target)?;
+        let target = confined_entry(self, &parent_path, &relative_path)?;
         fs::remove_file(target.as_std_path()).map_err(|err| io_error("fs.remove-file", err))
     }
 
@@ -551,10 +522,8 @@ impl bindings::osagent::fs::fs::Host for HostState {
         new_path: String,
     ) -> Result<(), CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
-        let from = resolve_child(&parent_path, &old_path)?;
-        let to = resolve_child(&parent_path, &new_path)?;
-        ensure_within_workspace(&self.config.workspace_root, &from)?;
-        ensure_within_workspace(&self.config.workspace_root, &to)?;
+        let from = confined_entry(self, &parent_path, &old_path)?;
+        let to = confined_entry(self, &parent_path, &new_path)?;
         fs::rename(from.as_std_path(), to.as_std_path()).map_err(|err| io_error("fs.rename", err))
     }
 
@@ -586,9 +555,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
     ) -> Result<bindings::osagent::fs::fs::EntryMetadata, CapabilityError> {
         let base = dir_path(self, &parent)?.to_path_buf();
         let path = if let Some(rel) = relative_path {
-            let joined = resolve_child(&base, &rel)?;
-            ensure_within_workspace(&self.config.workspace_root, &joined)?;
-            joined
+            confined(self, &base, &rel)?
         } else {
             base
         };
@@ -613,8 +580,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
         options: bindings::osagent::fs::fs::FileOpenOptions,
     ) -> Result<Resource<FileHandle>, CapabilityError> {
         let parent_path = dir_path_buf(self, &parent)?;
-        let file_path = resolve_child(&parent_path, &relative_path)?;
-        ensure_within_workspace(&self.config.workspace_root, &file_path)?;
+        let file_path = confined(self, &parent_path, &relative_path)?;
         let mut open_opts = OpenOptions::new();
         open_opts.read(options.read);
         open_opts.write(options.write || options.append);
@@ -635,9 +601,9 @@ impl bindings::osagent::fs::fs::Host for HostState {
 }
 
 impl bindings::osagent::fs::fs::HostDirHandle for HostState {
-    fn close(&mut self, handle: Resource<DirHandle>) {
-        let _ = delete_dir(self, handle);
-    }
+    /// Nothing to release for a directory; the entry goes when the guest drops the handle. (`close`
+    /// gets a borrowed handle, which the table must not delete.)
+    fn close(&mut self, _handle: Resource<DirHandle>) {}
 
     fn drop(&mut self, handle: Resource<DirHandle>) -> wasmtime::Result<()> {
         let _ = delete_dir(self, handle);
@@ -707,8 +673,12 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
             .map_err(|err| io_error("fs.file.flush", err))
     }
 
+    /// Flushes the file; the entry (and the open file) goes when the guest drops the handle. (`close`
+    /// gets a borrowed handle, which the table must not delete.)
     fn close(&mut self, handle: Resource<FileHandle>) {
-        let _ = delete_file(self, handle);
+        if let Ok(file) = file_entry_mut(self, &handle) {
+            let _ = file.file.flush();
+        }
     }
 
     fn drop(&mut self, handle: Resource<FileHandle>) -> wasmtime::Result<()> {
@@ -723,13 +693,15 @@ impl bindings::osagent::proc::proc::Host for HostState {
         command: String,
         options: bindings::osagent::proc::proc::SpawnOptions,
     ) -> Result<Resource<ProcHandle>, CapabilityError> {
-        ensure_command_allowed(&self.config, &command)?;
-
-        if options.timeout_ms.is_some() {
+        let Some(program) = self.config.program_for(&command).map(Path::to_path_buf) else {
             return Err(capability_error(
-                CapabilityErrorCode::InvalidArgument,
-                "timeout is not supported yet",
+                CapabilityErrorCode::Denied,
+                format!("command `{command}` is not allowed"),
             ));
+        };
+        for env in &options.env {
+            sandbox::check_env_key(&env.key)
+                .map_err(|why| capability_error(CapabilityErrorCode::Denied, why))?;
         }
 
         if !matches!(
@@ -754,14 +726,15 @@ impl bindings::osagent::proc::proc::Host for HostState {
             ));
         }
 
-        let mut cmd = Command::new(&command);
+        // The allowlist's resolved program, never a PATH lookup of the guest's string.
+        let mut cmd = Command::new(program);
         for arg in options.argv {
             cmd.arg(arg);
         }
 
         let working_dir = if let Some(dir) = options.working_dir {
-            let resolved = resolve_child(&self.config.workspace_root, &dir)?;
-            ensure_within_workspace(&self.config.workspace_root, &resolved)?;
+            let root = self.config.workspace_root.clone();
+            let resolved = confined(self, &root, &dir)?;
             Some(resolved)
         } else {
             None
@@ -772,23 +745,22 @@ impl bindings::osagent::proc::proc::Host for HostState {
             cmd.current_dir(self.config.workspace_root.as_std_path());
         }
 
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
         cmd.env_clear();
         for env in options.env {
             cmd.env(env.key, env.value);
         }
 
-        let output = cmd.output().map_err(|err| io_error("proc.spawn", err))?;
+        // Runs to completion here (bounded in time and output); the handle then serves its results.
+        let output = sandbox::run_bounded(cmd, sandbox::proc_timeout(options.timeout_ms))
+            .map_err(|err| io_error("proc.spawn", err))?;
         let resource = ProcessResource {
             command: command.clone(),
             stdout: output.stdout,
             stderr: output.stderr,
             stdout_pos: 0,
             stderr_pos: 0,
-            exit_code: output.status.code(),
-            timed_out: false,
+            exit_code: output.status,
+            timed_out: output.timed_out,
         };
         insert_process(self, resource)
     }
@@ -860,8 +832,15 @@ impl bindings::osagent::proc::proc::HostProcess for HostState {
         ))
     }
 
+    /// Releases the buffered output; the entry goes when the guest drops the handle. (`close` gets a
+    /// borrowed handle, which the table must not delete.)
     fn close(&mut self, handle: Resource<ProcHandle>) {
-        let _ = delete_process(self, handle);
+        if let Ok(process) = process_entry_mut(self, &handle) {
+            process.stdout = Vec::new();
+            process.stderr = Vec::new();
+            process.stdout_pos = 0;
+            process.stderr_pos = 0;
+        }
     }
 
     fn drop(&mut self, handle: Resource<ProcHandle>) -> wasmtime::Result<()> {
