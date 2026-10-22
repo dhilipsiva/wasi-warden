@@ -23,7 +23,9 @@ cargo run -p hostd -- run \
   --task "Log into https://demo.example/login with the demo_username and demo_password secrets and confirm the dashboard greets the user."
 ```
 
-The sample task is described in [docs/browser-login-task.md](docs/browser-login-task.md).
+The sample task is described in [docs/browser-login-task.md](docs/browser-login-task.md). How the pieces fit
+is in [docs/architecture.md](docs/architecture.md), what the design defends against (and what it does not) in
+[docs/threat-model.md](docs/threat-model.md), and how to contribute in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

@@ -3,7 +3,7 @@
 `wasi-warden` tracks the design, policy, and soon the Rust host plus WASI guest that form the secure automation stack. Treat every change as part of defense-in-depth: keep scope tight, document assumptions, and prefer auditable code paths.
 
 ## Project Structure & Module Organization
-The workspace has three code directories: `hostd/` (the privileged Rust host), `agent-core/` (the WASI component) and `wit/` (the shared interfaces), plus `tools/wit-check` (parses `wit/`). Host adapters live in `hostd/src/capabilities.rs` (the WIT host traits) and `hostd/src/actions.rs` (the executor for the planner's JSON actions); guest planning logic lives in `agent-core/src`. Keep experiments and threat-model notes under `docs/research/`, not beside production code. Read the README's Status section first: it lists what is not implemented yet.
+The workspace has three code directories: `hostd/` (the privileged Rust host), `agent-core/` (the WASI component) and `wit/` (the shared interfaces), plus `tools/wit-check` (parses `wit/`). Host adapters live in `hostd/src/capabilities.rs` (the WIT host traits) and `hostd/src/actions.rs` (the executor for the planner's JSON actions); guest planning logic lives in `agent-core/src`. `docs/architecture.md` describes how the pieces fit and `docs/threat-model.md` what they defend against; keep it current when a rule changes. Keep experiments under `docs/research/`, not beside production code. Read the README's Status section first: it lists what is not implemented yet. CONTRIBUTING.md has the working rules (tests first, both executors, defaults deny).
 
 ## Build, Test, and Development Commands
 Run these from the repository root inside `nix develop` (the flake pins Rust with the `wasm32-wasip2` target):
