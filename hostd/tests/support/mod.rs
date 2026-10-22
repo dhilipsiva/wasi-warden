@@ -203,6 +203,8 @@ pub fn fake_webdriver_quitting_in(quit_delay: std::time::Duration) -> (u16, Requ
     let url = Arc::new(Mutex::new(String::from("data:,")));
     // A page on `late.example.test` navigates away by itself after it was first looked at.
     let late_reads = Arc::new(Mutex::new(0u32));
+    // The page echoes what was last typed into its element, as a page showing its input would.
+    let typed = Arc::new(Mutex::new(String::new()));
     let port = serve(move |method, path, body| {
         log.lock()
             .expect("log")
@@ -218,12 +220,39 @@ pub fn fake_webdriver_quitting_in(quit_delay: std::time::Duration) -> (u16, Requ
                 serde_json::json!("Fake title")
             }
             ("GET", p) if p == format!("/session/{SESSION}/source") => {
-                serde_json::json!(
-                    "<html><body><p data-test='user-greeting'>Hello</p></body></html>"
-                )
+                let typed = typed.lock().expect("typed");
+                serde_json::json!(format!(
+                    "<html><body><p data-test='user-greeting'>Hello</p><input id='password' value='{typed}'></body></html>"
+                ))
+            }
+            ("POST", p) if p == format!("/session/{SESSION}/element/fake-element-1/value") => {
+                let sent: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                *typed.lock().expect("typed") = sent["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim_end_matches('\u{e007}')
+                    .to_string();
+                serde_json::Value::Null
+            }
+            ("GET", p)
+                if p == format!("/session/{SESSION}/element/fake-element-1/property/outerHTML") =>
+            {
+                let typed = typed.lock().expect("typed");
+                serde_json::json!(format!("<input id='password' value='{typed}'>"))
+            }
+            ("GET", p)
+                if p == format!("/session/{SESSION}/element/fake-element-1/attribute/value") =>
+            {
+                serde_json::json!(*typed.lock().expect("typed"))
             }
             ("POST", p) if p == format!("/session/{SESSION}/element") => {
                 serde_json::json!({ "element-6066-11e4-a52e-4f735466cecf": "fake-element-1" })
+            }
+            ("GET", p) if p == format!("/session/{SESSION}/screenshot") => {
+                // A 1x1 PNG.
+                serde_json::json!(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                )
             }
             ("POST", p) if p == format!("/session/{SESSION}/elements") => {
                 // `#missing` is never on the page.
@@ -234,7 +263,12 @@ pub fn fake_webdriver_quitting_in(quit_delay: std::time::Duration) -> (u16, Requ
                 }
             }
             ("GET", p) if p == format!("/session/{SESSION}/element/fake-element-1/text") => {
-                serde_json::json!("fake text")
+                let typed = typed.lock().expect("typed");
+                if typed.is_empty() {
+                    serde_json::json!("fake text")
+                } else {
+                    serde_json::json!(format!("fake text {typed}"))
+                }
             }
             ("DELETE", p) if p.starts_with("/session/") => {
                 thread::sleep(quit_delay);
@@ -367,6 +401,11 @@ pub fn run_step(config: &Path, task: &str) -> Output {
 
 /// Run `hostd step` for `task` with `component` and `config`.
 pub fn run_step_with(component: &Path, config: &Path, task: &str) -> Output {
+    run_step_logged(component, config, task, "info")
+}
+
+/// Like [`run_step_with`], with `RUST_LOG` set to `rust_log`.
+pub fn run_step_logged(component: &Path, config: &Path, task: &str, rust_log: &str) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hostd"));
     cmd.arg("step")
         .arg("--component")
@@ -374,7 +413,7 @@ pub fn run_step_with(component: &Path, config: &Path, task: &str) -> Output {
         .arg("--config")
         .arg(config)
         .args(["--task", task, "--observation", "{}"])
-        .env("RUST_LOG", "info");
+        .env("RUST_LOG", rust_log);
     for var in PROXY_VARS {
         cmd.env_remove(var);
     }

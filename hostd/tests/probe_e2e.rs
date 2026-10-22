@@ -822,3 +822,147 @@ fn the_wit_calls_are_audited() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The planted secret value of the secret tests.
+const SECRET: &str = "planted-s3cret-9f2c";
+
+/// Each secret guard on the WIT path, on its own: a reference resolves in a process's environment
+/// and in typed text; the process's output and the page's text, HTML and value come back redacted;
+/// what the guest itself sends the model, a message or a tool schema, is redacted; and neither the
+/// audit log (inputs and errors) nor the log lines, at trace level, hold the value.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn secrets_hold_through_the_wit_capabilities() {
+    let done =
+        serde_json::json!({ "status": "complete", "thought": "ok", "actions": [], "reason": "ok" });
+    let (llm_port, llm_seen) = support::fake_llm(vec![done.clone(), done]);
+    let (wd_port, wd_seen) = support::fake_webdriver();
+    let sh = which("sh");
+    let root = support::scratch_dir("witsecrets");
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).expect("workspace");
+    std::fs::write(ws.join("secret.txt"), SECRET).expect("secret.txt");
+    std::os::unix::fs::symlink("/", ws.join("out")).expect("symlink");
+    let audit = root.join("audit.jsonl");
+    let config = root.join("hostd.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "workspace_root = {:?}\nallow_proc = [{sh:?}]\nallow_env = [\"TOKEN\"]\n\
+             [llm]\napi_base = \"http://127.0.0.1:{llm_port}/v1\"\napi_key = \"test\"\nmodel = \"scripted\"\n\
+             [browser]\nwebdriver_url = \"http://127.0.0.1:{wd_port}\"\nallowed_hosts = [\"login.example.test\"]\n\
+             [secrets]\ndemo_password = {SECRET:?}\n[audit]\npath = {:?}\n",
+            ws.display().to_string(),
+            audit.display().to_string()
+        ),
+    )
+    .expect("config");
+    let task =
+        serde_json::json!({ "mode": "secrets", "sh": sh, "url": "http://login.example.test/" });
+    let out = support::run_step_logged(
+        &support::probe_component(),
+        &config,
+        &task.to_string(),
+        "info,hostd=trace",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let results: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ws.join("results.json")).expect("results"))
+            .expect("results are JSON");
+    let reference = "{{secret:demo_password}}";
+    let stdout = results["stdout"].as_str().unwrap_or_default();
+    assert!(
+        stdout.contains(&format!("len={}", SECRET.len())),
+        "the process got the value: {results}"
+    );
+    assert!(
+        stdout.contains(&format!("TOKEN={reference}")) && !stdout.contains(SECRET),
+        "its stdout came back redacted: {stdout}"
+    );
+    let err = results["stderr"].as_str().unwrap_or_default();
+    assert!(
+        err.contains(&format!("ERR={reference}")) && !err.contains(SECRET),
+        "and its stderr: {err}"
+    );
+    let wd = wd_seen.lock().expect("webdriver log");
+    assert!(
+        wd.iter()
+            .any(|(m, p, b)| m == "POST" && p.ends_with("/value") && b.contains(SECRET)),
+        "the value was typed into the page: {wd:?}"
+    );
+    for key in ["text", "html", "value", "page"] {
+        let seen = results["browser"][key].as_str().unwrap_or_default();
+        assert!(
+            seen.contains(reference) && !seen.contains(SECRET),
+            "the page's {key} came back redacted: {}",
+            results["browser"]
+        );
+    }
+    let llm = llm_seen.lock().expect("llm log");
+    assert!(
+        llm.iter()
+            .any(|r| r.contains(&format!("the file says {reference}"))),
+        "the guest's message reached the model, redacted: {llm:?}"
+    );
+    assert!(
+        llm.iter()
+            .any(|r| r.contains(&format!("looks up {reference}"))),
+        "and its tool schema: {llm:?}"
+    );
+    assert!(!llm.iter().any(|r| r.contains(SECRET)), "{llm:?}");
+    let audit = std::fs::read_to_string(&audit).expect("the audit log");
+    assert!(
+        audit.contains(&format!("out/{reference}")) && audit.contains("escapes the workspace"),
+        "the refused call is audited, its input and error redacted: {audit}"
+    );
+    assert!(!audit.contains(SECRET), "the audit log holds no value");
+    assert!(
+        !stderr.contains(SECRET),
+        "nor the log lines, even at trace level"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The planner's reports reach the agent with every secret value redacted: a process given a secret
+/// gets its value, and neither its output nor an error naming the value comes back.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn the_planners_reports_hold_no_secret() {
+    let sh = which("sh");
+    let (root, ws, config) = probe_setup(
+        "reportsecrets",
+        &format!(
+            "allow_proc = [{sh:?}]\nallow_env = [\"TOKEN\"]\n[secrets]\ndemo_password = {SECRET:?}\n"
+        ),
+    );
+    let task = serde_json::json!({
+        "mode": "observe",
+        "actions": [
+            {
+                "capability": "proc.spawn",
+                "input": {
+                    "command": sh,
+                    "args": ["-c", "echo \"len=${#TOKEN}\"; echo \"TOKEN=$TOKEN\""],
+                    "env": [{ "key": "TOKEN", "value": "{{secret:demo_password}}" }]
+                }
+            },
+            { "capability": "fs.read_file", "input": { "path": format!("missing-{SECRET}.txt") } }
+        ]
+    });
+    let observed = probe_results(&config, &ws, task).to_string();
+    assert!(
+        observed.contains(&format!("len={}", SECRET.len())),
+        "the process got the value: {observed}"
+    );
+    assert!(
+        observed.contains("TOKEN={{secret:demo_password}}"),
+        "its output came back redacted: {observed}"
+    );
+    assert!(
+        observed.contains("missing-{{secret:demo_password}}.txt"),
+        "the failed read's error came back, redacted: {observed}"
+    );
+    assert!(!observed.contains(SECRET), "{observed}");
+    let _ = std::fs::remove_dir_all(&root);
+}

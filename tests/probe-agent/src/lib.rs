@@ -3,8 +3,10 @@
 //! the real bindings, and records what each call returned in `results.json` in the workspace. The
 //! task is a JSON object: `mode` picks what to probe (`rules`, the default; `write_ops`; `policy`;
 //! `browser`; `browser_budget`; `sessions`; `downloads`; `spend`, which asks the LLM twice a round
-//! and plans nothing; `long_spawn`; `input`; `burn`, which loops forever; `sleep`, which sleeps `ms`
-//! in WASI; or `grow`, which allocates `mib` MiB), and the rest names the programs and URLs to try.
+//! and plans nothing; `long_spawn`; `input`; `secrets`; `burn`, which loops forever; `sleep`, which
+//! sleeps `ms` in WASI; `grow`, which allocates `mib` MiB; or `observe`, which plans the task's
+//! `actions` and records the observation the host sends back), and the rest names the programs and
+//! URLs to try.
 
 use std::time::{Duration, Instant};
 
@@ -19,12 +21,14 @@ mod bindings {
     });
 }
 
-use bindings::exports::osagent::agent::planner::{self, AgentError, CompletePlan, StepResponse};
+use bindings::exports::osagent::agent::planner::{
+    self, AgentError, CompletePlan, ContinuePlan, PlannedAction, StepResponse,
+};
 use bindings::osagent::browser::browser::{self, Selector, SelectorKind, SessionOptions};
 use bindings::osagent::common::types::{AuditEvent, CapabilityError, CapabilityErrorCode};
 use bindings::osagent::fs::fs::{self, DirHandle, FileOpenOptions};
 use bindings::osagent::input::input;
-use bindings::osagent::llm::llm::{self, Message, Options, Role};
+use bindings::osagent::llm::llm::{self, Message, Options, Role, ToolSchema};
 use bindings::osagent::policy::policy::{self, BudgetKind, GrantRequest};
 use bindings::osagent::proc::proc::{self, EnvVar, SpawnOptions, StdioMode};
 
@@ -429,6 +433,122 @@ fn probe_browser(task: &Value) -> Map<String, Value> {
     out
 }
 
+/// Secrets through the WIT capabilities. A `{{secret:NAME}}` reference resolves only where it
+/// leaves the host (a process's environment, text typed into a page); the value comes back from
+/// neither, and does not reach the model even when the guest, which read it from `secret.txt`,
+/// sends it.
+fn probe_secrets(task: &Value, ws: &DirHandle) -> Map<String, Value> {
+    let reference = "{{secret:demo_password}}";
+    let mut out = Map::new();
+    let env = vec![EnvVar {
+        key: "TOKEN".into(),
+        value: reference.into(),
+    }];
+    let script = "echo \"len=${#TOKEN}\"; echo \"TOKEN=$TOKEN\"; echo \"ERR=$TOKEN\" >&2";
+    let sh = task["sh"].as_str().unwrap_or_default().to_string();
+    let ran = proc::spawn(&sh, &spawn_options(&["-c", script], env, None)).and_then(|p| {
+        let stdout = p.read_stdout(1024)?;
+        let stderr = p.read_stderr(1024)?;
+        p.close();
+        Ok([stdout.data, stderr.data].map(|d| String::from_utf8_lossy(&d).into_owned()))
+    });
+    match ran {
+        Ok([stdout, stderr]) => {
+            out.insert("stdout".into(), json!(stdout));
+            out.insert("stderr".into(), json!(stderr));
+        }
+        Err(e) => {
+            out.insert("spawn".into(), json!(e.message));
+        }
+    }
+
+    let planted = fs::open_file(ws, "secret.txt", read_only())
+        .and_then(|f| f.read_to_string(256))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let message = Message {
+        role: Role::User,
+        content: format!("the file says {planted}"),
+        name: None,
+    };
+    let options = Options {
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        stop: Vec::new(),
+        presence_penalty: None,
+        frequency_penalty: None,
+    };
+    out.insert(
+        "complete".into(),
+        outcome(&llm::complete(std::slice::from_ref(&message), &options)),
+    );
+    let tool = ToolSchema {
+        name: "lookup".into(),
+        description: format!("looks up {planted}"),
+        schema_json: json!({ "type": "object", "description": planted }).to_string(),
+    };
+    out.insert(
+        "call_tools".into(),
+        outcome(&llm::call_tools(&[message], &[tool], &options)),
+    );
+    // A refusal that names the value (`out` links outside the workspace).
+    out.insert(
+        "escape".into(),
+        outcome(&fs::open_file(ws, &format!("out/{planted}"), read_only())),
+    );
+
+    let options = SessionOptions {
+        profile: None,
+        headless: true,
+        allow_downloads: false,
+    };
+    let url = task["url"].as_str().unwrap_or_default().to_string();
+    let typed = browser::open_session(&options).and_then(|session| {
+        session.goto(&url, Some(0))?;
+        let selector = Selector {
+            kind: SelectorKind::Css,
+            value: "input#password".into(),
+        };
+        let field = session.find(&selector, Some(0))?;
+        field.type_text(reference, false)?;
+        let seen = json!({
+            "text": field.inner_text()?,
+            "html": field.html()?,
+            "value": field.attribute("value")?,
+            "page": session.describe_page(true)?.html,
+        });
+        drop(field);
+        session.close();
+        Ok(seen)
+    });
+    out.insert(
+        "browser".into(),
+        typed.unwrap_or_else(|e| json!(format!("refused: {}", e.message))),
+    );
+    out
+}
+
+/// The task's `actions`, as the plan (the `observe` mode's first round).
+fn planned(task: &Value) -> ContinuePlan {
+    let actions = task["actions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| PlannedAction {
+            capability: a["capability"].as_str().unwrap_or_default().to_string(),
+            input: a["input"].to_string(),
+            audit_tag: None,
+        })
+        .collect();
+    ContinuePlan {
+        thought: "the task's actions".into(),
+        actions,
+    }
+}
+
 fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
     let task: Value = serde_json::from_str(task).unwrap_or_default();
     match task["mode"].as_str().unwrap_or("rules") {
@@ -484,6 +604,7 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
             out.insert("grew".into(), json!(grown.len()));
             return out;
         }
+        "secrets" => return probe_secrets(&task, ws),
         "input" => {
             let mut out = Map::new();
             out.insert("key_sequence".into(), outcome(&input::key_sequence("x")));
@@ -695,7 +816,7 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
 }
 
 impl planner::Guest for Probe {
-    fn step(task: String, _observation: planner::Observation) -> Result<StepResponse, AgentError> {
+    fn step(task: String, observation: planner::Observation) -> Result<StepResponse, AgentError> {
         let fail = |message: String| AgentError {
             retryable: false,
             message,
@@ -718,7 +839,18 @@ impl planner::Guest for Probe {
                 actions: Vec::new(),
             }));
         }
-        let results = Value::Object(probe(&task, &ws)).to_string();
+        let parsed: Value = serde_json::from_str(&task).unwrap_or_default();
+        let results = if parsed["mode"] == "observe" {
+            let data: Value = serde_json::from_str(&observation.data).unwrap_or_default();
+            if data.get("actions").is_none() {
+                ws.close();
+                return Ok(StepResponse::Continue(planned(&parsed)));
+            }
+            // The next round: what the host reported back.
+            data.to_string()
+        } else {
+            Value::Object(probe(&task, &ws)).to_string()
+        };
         let options = FileOpenOptions {
             read: false,
             write: true,
