@@ -17,17 +17,18 @@ use crate::browser::{self, Browser, Select};
 const MAX_EVENT_BYTES: usize = 4096;
 /// The most events and grant requests the agent may log in a run.
 const MAX_EVENTS: u32 = 1000;
-/// The longest one LLM request may take.
-const LLM_TIMEOUT: Duration = Duration::from_secs(60);
+use crate::audit::Audit;
 use crate::budget::{self, Kind};
-use crate::config::{HostConfig, LlmSettings};
+use crate::config::{HostConfig, LlmProvider, LlmSettings};
 use crate::resources::{
     BrowserElementResource, BrowserSessionResource, DirHandleResource, FileHandleResource,
     ProcessResource,
 };
+use crate::router;
 use crate::sandbox;
 use crate::secrets::Secrets;
 use crate::state::HostState;
+use crate::telemetry::{SCHEMA_VERSION, Telemetry, TelemetryEvent};
 use bindings::osagent::llm::llm::Role as MessageRole;
 
 type CapabilityError = bindings::osagent::common::types::CapabilityError;
@@ -106,14 +107,14 @@ struct ChatMessage {
     name: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ChatTool {
     #[serde(rename = "type")]
     kind: &'static str,
     function: ChatToolFunction,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ChatToolFunction {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,24 +177,46 @@ fn convert_usage(usage: Option<ChatUsage>) -> Option<bindings::osagent::llm::llm
     })
 }
 
-/// The tokens a call is charged: the endpoint's total, or its prompt and completion counts, or, when
-/// it reports neither, an estimate of a token per four bytes of the request and the reply. An
-/// endpoint that reports nothing cannot switch the budget off.
-fn tokens_charged(usage: Option<&ChatUsage>, request: &ChatRequest, reply_bytes: usize) -> u64 {
-    let reported =
-        usage.and_then(
-            |u| match (u.total_tokens, u.prompt_tokens, u.completion_tokens) {
-                (Some(total), _, _) if total > 0 => Some(u64::from(total)),
-                (_, None, None) => None,
-                (_, prompt, completion) => {
-                    Some(u64::from(prompt.unwrap_or(0)) + u64::from(completion.unwrap_or(0)))
-                }
-            },
+/// The tokens a call used: the endpoint's prompt and completion counts (a total beyond them counts as
+/// completion; a total alone, all completion, priced as such), or, when it reports none, an estimate
+/// of a token per four bytes of the request and of the reply. An endpoint that reports nothing
+/// cannot switch the budget off.
+fn tokens_spent(
+    usage: Option<&ChatUsage>,
+    request: &ChatRequest,
+    reply_bytes: usize,
+) -> router::Spent {
+    let reported = usage.and_then(|u| {
+        let (prompt, completion) = (
+            u.prompt_tokens.map(u64::from),
+            u.completion_tokens.map(u64::from),
         );
-    reported.filter(|t| *t > 0).unwrap_or_else(|| {
-        let request_bytes = serde_json::to_vec(request).map(|v| v.len()).unwrap_or(0);
-        ((request_bytes + reply_bytes) as u64).div_ceil(4)
-    })
+        let total = u.total_tokens.map(u64::from).filter(|t| *t > 0);
+        match (prompt, completion, total) {
+            (None, None, None) => None,
+            (None, None, Some(total)) => Some((0, total)),
+            (prompt, completion, total) => {
+                let (prompt, completion) = (prompt.unwrap_or(0), completion.unwrap_or(0));
+                let extra = total.unwrap_or(0).saturating_sub(prompt + completion);
+                Some((prompt, completion + extra))
+            }
+        }
+    });
+    match reported.filter(|(p, c)| p + c > 0) {
+        Some((prompt, completion)) => router::Spent {
+            prompt,
+            completion,
+            estimated: false,
+        },
+        None => {
+            let request_bytes = serde_json::to_vec(request).map(|v| v.len()).unwrap_or(0);
+            router::Spent {
+                prompt: (request_bytes as u64).div_ceil(4),
+                completion: (reply_bytes as u64).div_ceil(4),
+                estimated: true,
+            }
+        }
+    }
 }
 
 /// The guest's `max_tokens`, never more than the token budget has left.
@@ -273,13 +296,13 @@ fn build_chat_request(
 }
 
 fn execute_chat_request(
-    settings: &LlmSettings,
+    provider: &LlmProvider,
     body: &ChatRequest,
     timeout: Duration,
 ) -> Result<ChatResponse, CapabilityError> {
-    let url = chat_endpoint(&settings.api_base);
+    let url = chat_endpoint(&provider.api_base);
     let agent = http_agent(timeout);
-    let token = format!("Bearer {}", settings.api_key);
+    let token = format!("Bearer {}", provider.api_key);
     let payload = serde_json::to_value(body).map_err(|err| {
         capability_error(
             CapabilityErrorCode::Internal,
@@ -434,11 +457,86 @@ impl HostState {
             .unwrap_or_default()
     }
 
-    /// Record the tokens a call used ([`tokens_charged`]).
-    fn spend_tokens(&self, tokens: u64) {
+    /// Record `units` of `kind` used (tokens and cost, after the call that used them).
+    fn spend(&self, kind: Kind, units: u64) {
         if let Ok(mut budgets) = self.budgets.lock() {
-            budgets.spend(Kind::LlmTokens, tokens);
+            budgets.spend(kind, units);
         }
+    }
+
+    /// Ask the configured providers in the router's order until one answers
+    /// ([`router::candidates`]). `answer` checks a response and measures its reply; one it rejects
+    /// counts as that provider failing. Every attempt is a telemetry event, and the one that answers
+    /// is charged its tokens and its cost.
+    fn ask_providers(
+        &self,
+        messages: Vec<bindings::osagent::llm::llm::Message>,
+        options: bindings::osagent::llm::llm::Options,
+        tools: Option<Vec<ChatTool>>,
+        answer: impl Fn(&ChatResponse) -> Result<usize, String>,
+    ) -> Result<ChatResponse, CapabilityError> {
+        let settings = require_llm_settings(&self.config)?;
+        let cost_left = self
+            .budgets
+            .lock()
+            .map(|b| b.remaining(Kind::LlmCostMicros))
+            .unwrap_or(0);
+        let (candidates, skipped_paid) = router::candidates(&settings.providers, cost_left);
+        if candidates.is_empty() {
+            return Err(limit(
+                "the llm_cost_micros budget is spent, and no free LLM provider is configured",
+            ));
+        }
+        let mut failed: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for (index, provider) in candidates.into_iter().enumerate() {
+            self.tokens_left()?;
+            let timeout = self.time_left()?.min(provider.timeout);
+            let mut options = options.clone();
+            options.max_tokens = clamp_max_tokens(options.max_tokens, self.tokens_remaining());
+            let request = build_chat_request(
+                &provider.model,
+                messages.clone(),
+                options,
+                tools.clone(),
+                &self.config.secrets,
+            );
+            let route_reason = router::route_reason(provider, &failed, skipped_paid);
+            let started = std::time::Instant::now();
+            let outcome = execute_chat_request(provider, &request, timeout).and_then(|response| {
+                answer(&response)
+                    .map(|reply| (response, reply))
+                    .map_err(|why| capability_error(CapabilityErrorCode::Internal, why))
+            });
+            let event = attempt_event(provider, index, route_reason, started.elapsed());
+            match outcome {
+                Ok((response, reply_bytes)) => {
+                    let spent = tokens_spent(response.usage.as_ref(), &request, reply_bytes);
+                    let cost = router::cost_micros(provider, &spent);
+                    self.spend(Kind::LlmTokens, spent.total());
+                    self.spend(Kind::LlmCostMicros, cost);
+                    emit(&TelemetryEvent {
+                        ok: true,
+                        prompt_tokens: spent.prompt,
+                        completion_tokens: spent.completion,
+                        tokens_estimated: spent.estimated,
+                        cost_micros: cost,
+                        ..event
+                    });
+                    return Ok(response);
+                }
+                Err(err) => {
+                    emit(&event.with_error(&err.message));
+                    errors.push(format!("{}: {}", provider.name, err.message));
+                    failed.push(provider.name.clone());
+                }
+            }
+        }
+        let mut message = format!("every LLM provider failed ({})", errors.join("; "));
+        if skipped_paid {
+            message.push_str("; paid providers were skipped: the llm_cost_micros budget is spent");
+        }
+        Err(capability_error(CapabilityErrorCode::Unavailable, message))
     }
 
     fn browser(&self) -> Result<Browser<'_>, CapabilityError> {
@@ -1382,45 +1480,23 @@ impl bindings::osagent::llm::llm::Host for HostState {
         messages: Vec<bindings::osagent::llm::llm::Message>,
         options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::CompletionResponse, CapabilityError> {
-        self.tokens_left()?;
-        let timeout = self.time_left()?.min(LLM_TIMEOUT);
-        let settings = require_llm_settings(&self.config)?;
-        let mut options = options;
-        options.max_tokens = clamp_max_tokens(options.max_tokens, self.tokens_remaining());
-        let request = build_chat_request(
-            &settings.model,
-            messages,
-            options,
-            None,
-            &self.config.secrets,
-        );
-        let response = execute_chat_request(settings, &request, timeout)?;
-        let reply_bytes = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_ref())
-            .map_or(0, String::len);
-        self.spend_tokens(tokens_charged(
-            response.usage.as_ref(),
-            &request,
-            reply_bytes,
-        ));
+        let response = self.ask_providers(messages, options, None, |response| {
+            response
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_ref())
+                .map(String::len)
+                .ok_or_else(|| "llm response missing content".to_string())
+        })?;
         let usage = convert_usage(response.usage);
-        let mut choices = response.choices.into_iter();
-        let choice = choices.next().ok_or_else(|| {
+        let choice = response.choices.into_iter().next().ok_or_else(|| {
             capability_error(
                 CapabilityErrorCode::Internal,
                 "llm response missing choices",
             )
         })?;
-        let content = choice.message.content.ok_or_else(|| {
-            capability_error(
-                CapabilityErrorCode::Internal,
-                "llm response missing content",
-            )
-        })?;
         Ok(bindings::osagent::llm::llm::CompletionResponse {
-            content,
+            content: choice.message.content.unwrap_or_default(),
             finish_reason: choice.finish_reason,
             usage,
         })
@@ -1432,42 +1508,28 @@ impl bindings::osagent::llm::llm::Host for HostState {
         tools: Vec<bindings::osagent::llm::llm::ToolSchema>,
         options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::ToolResponse, CapabilityError> {
-        self.tokens_left()?;
-        let timeout = self.time_left()?.min(LLM_TIMEOUT);
-        let settings = require_llm_settings(&self.config)?;
         let chat_tools = tools_to_chat(tools, &self.config.secrets)?;
-        let mut options = options;
-        options.max_tokens = clamp_max_tokens(options.max_tokens, self.tokens_remaining());
-        let request = build_chat_request(
-            &settings.model,
-            messages,
-            options,
-            Some(chat_tools),
-            &self.config.secrets,
-        );
-        let response = execute_chat_request(settings, &request, timeout)?;
-        let reply_bytes = response.choices.first().map_or(0, |c| {
-            serde_json::to_vec(&c.message.tool_calls).map_or(0, |v| v.len())
-        });
-        self.spend_tokens(tokens_charged(
-            response.usage.as_ref(),
-            &request,
-            reply_bytes,
-        ));
+        let response =
+            self.ask_providers(
+                messages,
+                options,
+                Some(chat_tools),
+                |response| match response.choices.first() {
+                    Some(choice) if !choice.message.tool_calls.is_empty() => {
+                        serde_json::to_vec(&choice.message.tool_calls)
+                            .map(|v| v.len())
+                            .map_err(|err| format!("failed to encode tool calls: {err}"))
+                    }
+                    _ => Err("llm response missing tool calls".to_string()),
+                },
+            )?;
         let usage = convert_usage(response.usage);
-        let mut choices = response.choices.into_iter();
-        let choice = choices.next().ok_or_else(|| {
+        let choice = response.choices.into_iter().next().ok_or_else(|| {
             capability_error(
                 CapabilityErrorCode::Internal,
                 "llm response missing choices",
             )
         })?;
-        if choice.message.tool_calls.is_empty() {
-            return Err(capability_error(
-                CapabilityErrorCode::Internal,
-                "llm response missing tool calls",
-            ));
-        }
         let tool_calls_json = serde_json::to_string(&choice.message.tool_calls).map_err(|err| {
             capability_error(
                 CapabilityErrorCode::Internal,
@@ -1482,6 +1544,41 @@ impl bindings::osagent::llm::llm::Host for HostState {
     }
 }
 
+/// The telemetry event for one attempt at `provider` (the `index`th asked), before its outcome.
+fn attempt_event(
+    provider: &LlmProvider,
+    index: usize,
+    route_reason: String,
+    latency: Duration,
+) -> TelemetryEvent {
+    let audit = Audit::current();
+    TelemetryEvent {
+        version: SCHEMA_VERSION,
+        kind: "llm_request".to_string(),
+        run: audit.map(|a| a.run().to_string()).unwrap_or_default(),
+        step: audit.map_or(0, Audit::step),
+        provider: provider.name.clone(),
+        tier: provider.tier.name().to_string(),
+        model: provider.model.clone(),
+        attempt: u32::try_from(index + 1).unwrap_or(u32::MAX),
+        ok: false,
+        error: None,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        tokens_estimated: false,
+        cost_micros: 0,
+        latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+        route_reason,
+    }
+}
+
+/// Write `event` to the run's telemetry, if it has any.
+fn emit(event: &TelemetryEvent) {
+    if let Some(telemetry) = Telemetry::current() {
+        telemetry.emit(event);
+    }
+}
+
 fn kind_of(kind: bindings::osagent::policy::policy::BudgetKind) -> Kind {
     use bindings::osagent::policy::policy::BudgetKind;
     match kind {
@@ -1491,6 +1588,7 @@ fn kind_of(kind: bindings::osagent::policy::policy::BudgetKind) -> Kind {
         BudgetKind::Processes => Kind::Processes,
         BudgetKind::FilesystemOps => Kind::FilesystemOps,
         BudgetKind::BrowserActions => Kind::BrowserActions,
+        BudgetKind::LlmCostMicros => Kind::LlmCostMicros,
     }
 }
 
@@ -1503,6 +1601,7 @@ fn wit_kind(kind: Kind) -> bindings::osagent::policy::policy::BudgetKind {
         Kind::Processes => BudgetKind::Processes,
         Kind::FilesystemOps => BudgetKind::FilesystemOps,
         Kind::BrowserActions => BudgetKind::BrowserActions,
+        Kind::LlmCostMicros => BudgetKind::LlmCostMicros,
     }
 }
 
@@ -1630,19 +1729,29 @@ mod tests {
         }
     }
 
-    /// The endpoint's total is charged; without one, its prompt and completion counts; without
-    /// either, an estimate (a token per four bytes), so a silent endpoint still spends the budget.
+    /// The endpoint's prompt and completion counts are charged (a total beyond them as completion;
+    /// a total alone as completion); without any, an estimate of a token per four bytes, so a silent
+    /// endpoint still spends the budget.
     #[test]
     fn a_call_is_charged_what_the_endpoint_reports_or_an_estimate() {
         let req = request(&"x".repeat(4000));
-        let reported = usage(Some(10), Some(5), Some(42));
-        assert_eq!(tokens_charged(Some(&reported), &req, 0), 42);
-        let no_total = usage(Some(10), Some(5), None);
-        assert_eq!(tokens_charged(Some(&no_total), &req, 0), 15);
-        let estimate = tokens_charged(None, &req, 400);
-        assert!(estimate >= 1100, "{estimate}");
+        let spent = |u: Option<ChatUsage>, reply| tokens_spent(u.as_ref(), &req, reply);
+        let reported = spent(Some(usage(Some(10), Some(5), Some(42))), 0);
         assert_eq!(
-            tokens_charged(Some(&usage(None, None, None)), &req, 400),
+            (reported.prompt, reported.completion, reported.estimated),
+            (10, 32, false)
+        );
+        let no_total = spent(Some(usage(Some(10), Some(5), None)), 0);
+        assert_eq!(no_total.total(), 15);
+        let total_only = spent(Some(usage(None, None, Some(42))), 0);
+        assert_eq!((total_only.prompt, total_only.completion), (0, 42));
+        let estimate = spent(None, 400);
+        assert!(
+            estimate.estimated && estimate.prompt >= 1000 && estimate.completion == 100,
+            "{estimate:?}"
+        );
+        assert_eq!(
+            spent(Some(usage(None, None, None)), 400),
             estimate,
             "an empty report is no report"
         );

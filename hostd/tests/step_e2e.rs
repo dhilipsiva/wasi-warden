@@ -671,3 +671,37 @@ fn paid_providers_stop_at_the_cost_budget() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A reply without content counts as the provider failing: the next one is asked.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn a_reply_without_content_falls_back() {
+    let (local, local_seen) = support::empty_llm();
+    let (frontier, frontier_seen) = support::fake_llm(list_then_complete());
+    let (root, config) = router_setup(
+        "emptyreply",
+        &format!(
+            "{}{}",
+            provider("local", "local", local, 0.0, 0.0),
+            provider("frontier", "frontier", frontier, 0.0, 0.0)
+        ),
+        "",
+    );
+    let out = support::run_step(&config, "List workspace files");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        local_seen.lock().unwrap().len(),
+        2,
+        "local was asked each round"
+    );
+    assert_eq!(
+        frontier_seen.lock().unwrap().len(),
+        2,
+        "and the frontier answered each time"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -621,6 +621,7 @@ mod tests {
             workspace_rules: crate::config::WorkspaceRules::default(),
             secrets: crate::secrets::Secrets::default(),
             audit_path: None,
+            telemetry_path: None,
         }
     }
 

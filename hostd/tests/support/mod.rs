@@ -80,6 +80,22 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<(String, String, St
     Some((method, path, String::from_utf8_lossy(&body).into_owned()))
 }
 
+/// A chat-completions endpoint that answers every request with HTTP 200 but no content; returns its
+/// port and the request bodies it saw.
+pub fn empty_llm() -> (u16, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let port = serve(move |_method, _path, body| {
+        log.lock().expect("log").push(body.to_string());
+        serde_json::json!({
+            "choices": [{ "message": { "role": "assistant" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1 }
+        })
+        .to_string()
+    });
+    (port, seen)
+}
+
 /// A chat-completions endpoint that fails every request with HTTP `status`; returns its port and
 /// how many requests it saw.
 pub fn failing_llm(status: u16) -> (u16, Arc<Mutex<usize>>) {

@@ -9,7 +9,8 @@ interface policy {
     llm-tokens,
     processes,
     filesystem-ops,
-    browser-actions
+    browser-actions,
+    llm-cost-micros
   }
 
   record budget-snapshot {

@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use camino::Utf8PathBuf;
 use serde::Deserialize;
 
@@ -33,6 +33,8 @@ pub struct HostConfig {
     pub secrets: Secrets,
     /// Where the audit log is appended (`[audit] path`), if anywhere.
     pub audit_path: Option<Utf8PathBuf>,
+    /// Where telemetry events are appended (`[telemetry] path`), if anywhere.
+    pub telemetry_path: Option<Utf8PathBuf>,
 }
 
 /// `[workspace]`: what the plan may do to the workspace.
@@ -55,10 +57,50 @@ impl Default for WorkspaceRules {
 }
 
 #[derive(Debug, Clone)]
+/// The LLM providers (`[llm]`, or `[[llm.providers]]`), in the order configured; the router
+/// decides the order it tries them in ([`crate::router`]).
 pub struct LlmSettings {
+    pub providers: Vec<LlmProvider>,
+}
+
+/// Where a provider runs; the router tries local ones first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// On the operator's own hardware (an Ollama, llama.cpp or LlamaEdge server).
+    Local,
+    /// A hosted API.
+    Frontier,
+}
+
+impl Tier {
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Local => "local",
+            Tier::Frontier => "frontier",
+        }
+    }
+}
+
+/// One OpenAI-compatible chat-completions endpoint.
+#[derive(Debug, Clone)]
+pub struct LlmProvider {
+    pub name: String,
+    pub tier: Tier,
     pub api_base: String,
     pub api_key: String,
     pub model: String,
+    /// The longest one request to it may take (cut further to the run's time left).
+    pub timeout: std::time::Duration,
+    /// Prices per million prompt and completion tokens, in the operator's price unit.
+    pub input_price: f64,
+    pub output_price: f64,
+}
+
+impl LlmProvider {
+    pub fn is_paid(&self) -> bool {
+        self.input_price > 0.0 || self.output_price > 0.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +165,11 @@ impl HostConfig {
                 .and_then(|a| a.path)
                 .map(|p| normalize_path(Path::new(&p)))
                 .transpose()?,
+            telemetry_path: file_cfg
+                .telemetry
+                .and_then(|t| t.path)
+                .map(|p| normalize_path(Path::new(&p)))
+                .transpose()?,
         })
     }
 
@@ -146,6 +193,7 @@ struct FileConfig {
     workspace: Option<WorkspaceFileSettings>,
     secrets: Option<std::collections::BTreeMap<String, SecretSource>>,
     audit: Option<AuditFileSettings>,
+    telemetry: Option<AuditFileSettings>,
 }
 
 /// One `[secrets]` entry: the value itself, or the environment variable holding it.
@@ -170,7 +218,7 @@ fn load_secrets(entries: std::collections::BTreeMap<String, SecretSource>) -> Re
     Ok(Secrets::new(values))
 }
 
-/// `[audit]`.
+/// `[audit]` and `[telemetry]`.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditFileSettings {
@@ -187,6 +235,7 @@ struct BudgetFileSettings {
     processes: Option<u64>,
     filesystem_ops: Option<u64>,
     browser_actions: Option<u64>,
+    llm_cost_micros: Option<u64>,
     guest_fuel: Option<u64>,
     guest_memory_bytes: Option<u64>,
 }
@@ -201,6 +250,7 @@ impl BudgetFileSettings {
             processes: self.processes.unwrap_or(d.processes),
             filesystem_ops: self.filesystem_ops.unwrap_or(d.filesystem_ops),
             browser_actions: self.browser_actions.unwrap_or(d.browser_actions),
+            llm_cost_micros: self.llm_cost_micros.unwrap_or(d.llm_cost_micros),
             guest_fuel: self.guest_fuel.unwrap_or(d.guest_fuel),
             guest_memory_bytes: self.guest_memory_bytes.unwrap_or(d.guest_memory_bytes),
         }
@@ -238,16 +288,41 @@ impl FileConfig {
     }
 }
 
+/// `[llm]`: one endpoint, or a list of them as `[[llm.providers]]`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LlmFileSettings {
+    name: Option<String>,
+    tier: Option<Tier>,
     api_base: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
+    timeout_ms: Option<u64>,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+    providers: Option<Vec<ProviderFileSettings>>,
 }
 
-impl LlmFileSettings {
-    fn into_settings(self) -> Result<Option<LlmSettings>> {
+/// One `[[llm.providers]]` entry.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderFileSettings {
+    name: Option<String>,
+    tier: Option<Tier>,
+    api_base: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+    timeout_ms: Option<u64>,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+}
+
+/// The longest one LLM request may take unless a provider says otherwise.
+const DEFAULT_LLM_TIMEOUT_MS: u64 = 60_000;
+
+impl ProviderFileSettings {
+    /// The provider, or none when it has no key or model (the single `[llm]` is then off).
+    fn into_provider(self, default_name: &str) -> Result<Option<LlmProvider>> {
         let api_key = match self.api_key {
             Some(key) if !key.trim().is_empty() => key,
             _ => return Ok(None),
@@ -256,15 +331,75 @@ impl LlmFileSettings {
             Some(model) if !model.trim().is_empty() => model,
             _ => return Ok(None),
         };
-        let api_base = self
-            .api_base
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        Ok(Some(LlmSettings {
-            api_base,
+        let name = self
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| default_name.to_string());
+        let price = |what: &str, value: Option<f64>| -> Result<f64> {
+            let value = value.unwrap_or(0.0);
+            if !value.is_finite() || value < 0.0 {
+                bail!(
+                    "llm provider `{name}`: {what} must be a price of 0 or more per million tokens"
+                );
+            }
+            Ok(value)
+        };
+        Ok(Some(LlmProvider {
+            input_price: price("input_price", self.input_price)?,
+            output_price: price("output_price", self.output_price)?,
+            name: name.clone(),
+            tier: self.tier.unwrap_or(Tier::Frontier),
+            api_base: self
+                .api_base
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             api_key,
             model,
+            timeout: std::time::Duration::from_millis(
+                self.timeout_ms.unwrap_or(DEFAULT_LLM_TIMEOUT_MS),
+            ),
         }))
+    }
+}
+
+impl LlmFileSettings {
+    fn into_settings(self) -> Result<Option<LlmSettings>> {
+        let single = ProviderFileSettings {
+            name: self.name,
+            tier: self.tier,
+            api_base: self.api_base,
+            api_key: self.api_key,
+            model: self.model,
+            timeout_ms: self.timeout_ms,
+            input_price: self.input_price,
+            output_price: self.output_price,
+        };
+        let Some(list) = self.providers.filter(|l| !l.is_empty()) else {
+            return Ok(single
+                .into_provider("default")?
+                .map(|p| LlmSettings { providers: vec![p] }));
+        };
+        if single.api_key.is_some() || single.model.is_some() || single.api_base.is_some() {
+            bail!("[llm] sets both an endpoint and [[llm.providers]]; use one or the other");
+        }
+        let mut providers = Vec::with_capacity(list.len());
+        for (i, entry) in list.into_iter().enumerate() {
+            let default_name = format!("provider-{}", i + 1);
+            let provider = entry.into_provider(&default_name)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[[llm.providers]] entry {} needs an api_key and a model",
+                    i + 1
+                )
+            })?;
+            if providers
+                .iter()
+                .any(|p: &LlmProvider| p.name == provider.name)
+            {
+                bail!("[[llm.providers]] names `{}` twice", provider.name);
+            }
+            providers.push(provider);
+        }
+        Ok(Some(LlmSettings { providers }))
     }
 }
 
@@ -387,7 +522,73 @@ mod tests {
             "[llm]\napi_key = \"k\"\nmodel = \"m\"\n",
         )))
         .unwrap();
-        assert_eq!(cfg.llm.unwrap().api_base, "https://api.openai.com/v1");
+        assert_eq!(
+            cfg.llm.unwrap().providers[0].api_base,
+            "https://api.openai.com/v1"
+        );
+    }
+
+    /// `[[llm.providers]]` lists several endpoints with their tiers, timeouts and prices; a single
+    /// `[llm]` is one free frontier provider named `default`.
+    #[test]
+    fn llm_providers_are_listed_with_tiers_and_prices() {
+        let cfg = HostConfig::from_step_args(&args(&write(
+            "providers",
+            "[[llm.providers]]\nname = \"box\"\ntier = \"local\"\napi_base = \"http://127.0.0.1:11434/v1\"\napi_key = \"k\"\nmodel = \"small\"\ntimeout_ms = 5000\n\
+             [[llm.providers]]\nname = \"api\"\napi_key = \"k\"\nmodel = \"large\"\ninput_price = 2.0\noutput_price = 10.0\n",
+        )))
+        .unwrap();
+        let providers = cfg.llm.unwrap().providers;
+        assert_eq!(providers.len(), 2);
+        assert_eq!(
+            (providers[0].name.as_str(), providers[0].tier),
+            ("box", Tier::Local)
+        );
+        assert_eq!(providers[0].timeout, std::time::Duration::from_millis(5000));
+        assert!(!providers[0].is_paid());
+        assert_eq!(
+            (
+                providers[1].tier,
+                providers[1].input_price,
+                providers[1].output_price
+            ),
+            (Tier::Frontier, 2.0, 10.0)
+        );
+        assert!(providers[1].is_paid());
+        let single = HostConfig::from_step_args(&args(&write(
+            "single",
+            "[llm]\napi_key = \"k\"\nmodel = \"m\"\n",
+        )))
+        .unwrap()
+        .llm
+        .unwrap()
+        .providers;
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            (single[0].name.as_str(), single[0].tier, single[0].is_paid()),
+            ("default", Tier::Frontier, false)
+        );
+    }
+
+    #[test]
+    fn a_bad_provider_list_is_an_error() {
+        for body in [
+            // An endpoint and a list both.
+            "[llm]\napi_key = \"k\"\nmodel = \"m\"\n[[llm.providers]]\napi_key = \"k\"\nmodel = \"m\"\n",
+            // An entry without a model.
+            "[[llm.providers]]\napi_key = \"k\"\n",
+            // A name twice.
+            "[[llm.providers]]\nname = \"a\"\napi_key = \"k\"\nmodel = \"m\"\n[[llm.providers]]\nname = \"a\"\napi_key = \"k\"\nmodel = \"m\"\n",
+            // A negative price.
+            "[[llm.providers]]\napi_key = \"k\"\nmodel = \"m\"\ninput_price = -1.0\n",
+            // An unknown tier.
+            "[[llm.providers]]\ntier = \"edge\"\napi_key = \"k\"\nmodel = \"m\"\n",
+        ] {
+            assert!(
+                HostConfig::from_step_args(&args(&write("badproviders", body))).is_err(),
+                "accepted: {body}"
+            );
+        }
     }
 
     #[test]

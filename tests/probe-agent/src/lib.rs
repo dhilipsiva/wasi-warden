@@ -135,6 +135,7 @@ fn kind_name(kind: BudgetKind) -> &'static str {
         BudgetKind::Processes => "processes",
         BudgetKind::FilesystemOps => "filesystem_ops",
         BudgetKind::BrowserActions => "browser_actions",
+        BudgetKind::LlmCostMicros => "llm_cost_micros",
     }
 }
 

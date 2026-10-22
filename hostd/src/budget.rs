@@ -21,17 +21,20 @@ pub enum Kind {
     FilesystemOps,
     /// Browser actions.
     BrowserActions,
+    /// What LLM calls cost, in millionths of the unit the providers' prices are in.
+    LlmCostMicros,
 }
 
 impl Kind {
     /// Every kind, in the order the policy snapshot lists them.
-    pub const ALL: [Kind; 6] = [
+    pub const ALL: [Kind; 7] = [
         Kind::Steps,
         Kind::WallclockMs,
         Kind::LlmTokens,
         Kind::Processes,
         Kind::FilesystemOps,
         Kind::BrowserActions,
+        Kind::LlmCostMicros,
     ];
 
     /// The `[budgets]` key that sets this kind's limit.
@@ -43,6 +46,7 @@ impl Kind {
             Kind::Processes => "processes",
             Kind::FilesystemOps => "filesystem_ops",
             Kind::BrowserActions => "browser_actions",
+            Kind::LlmCostMicros => "llm_cost_micros",
         }
     }
 
@@ -60,6 +64,9 @@ pub struct Limits {
     pub processes: u64,
     pub filesystem_ops: u64,
     pub browser_actions: u64,
+    /// What the run's LLM calls may cost, in millionths of the price unit; paid providers are not
+    /// tried once it is spent.
+    pub llm_cost_micros: u64,
     /// Wasm fuel the agent may burn in one planner round; 0 for no limit (the wall-clock budget
     /// still interrupts it).
     pub guest_fuel: u64,
@@ -76,6 +83,7 @@ impl Default for Limits {
             processes: 32,
             filesystem_ops: 10_000,
             browser_actions: 200,
+            llm_cost_micros: 1_000_000,
             guest_fuel: 10_000_000_000,
             guest_memory_bytes: 256 << 20,
         }
@@ -92,6 +100,7 @@ impl Limits {
             Kind::Processes => self.processes,
             Kind::FilesystemOps => self.filesystem_ops,
             Kind::BrowserActions => self.browser_actions,
+            Kind::LlmCostMicros => self.llm_cost_micros,
         }
     }
 }
@@ -100,7 +109,7 @@ impl Limits {
 #[derive(Debug)]
 pub struct Budgets {
     limits: Limits,
-    used: [u64; 6],
+    used: [u64; Kind::ALL.len()],
     started: Instant,
 }
 
@@ -111,7 +120,7 @@ impl Budgets {
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
-            used: [0; 6],
+            used: [0; Kind::ALL.len()],
             started: Instant::now(),
         }
     }

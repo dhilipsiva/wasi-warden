@@ -125,7 +125,7 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
 * A bounded loop: `hostd step` asks the planner for a plan, executes its actions natively (`hostd/src/actions.rs`)
   and feeds the results back, within the run's budgets (`[budgets]`, below).
 
-What does not work yet (the tests: 72 hostd and 7 agent-core unit tests, and 41 end-to-end tests that run
+What does not work yet (the tests: 81 hostd and 7 agent-core unit tests, and 45 end-to-end tests that run
 the agent, a probe guest of the WIT capabilities and the browser against scripted fakes, in CI):
 
 * **No input backend**: every `input` call is refused, and so is the browser's script evaluation.
@@ -182,7 +182,10 @@ Expect breaking changes. The progress snapshot is in [docs/status.md](docs/statu
   * Fully disabled by default.
 * **LLM integration**
 
-  * Single interface for OpenAI-compatible and local models.
+  * Single interface for OpenAI-compatible and local models. Several can be configured: the router tries
+    local ones first, falls back on failure, and stops paying once the cost budget is spent
+    ([docs/design/router.md](docs/design/router.md)); each attempt is a telemetry event
+    ([docs/design/telemetry.md](docs/design/telemetry.md)).
   * Supports tool-calling / JSON plans.
 * **Policies**
 
@@ -285,6 +288,8 @@ The design's rules:
     what is left; the call that crosses the limit is the last.
   * `processes` (32), `filesystem_ops` (10,000) and `browser_actions` (200): one per operation, refused past
     the limit.
+  * `llm_cost_micros` (1,000,000, that is 1.00 in the providers' price unit): what LLM calls cost at the
+    configured prices; once spent, paid providers are no longer tried.
   * A spent budget is refused with the `limit` error code, so a guest can tell it from a rule's refusal.
   * `guest_fuel` (10,000,000,000 per round; 0 for no limit): wasm work, so a guest that computes forever is
     stopped.

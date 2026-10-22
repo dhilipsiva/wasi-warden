@@ -24,10 +24,12 @@ mod cli;
 mod config;
 mod logging;
 mod registry;
+mod router;
 mod runtime;
 mod sandbox;
 mod secrets;
 mod state;
+mod telemetry;
 
 use anyhow::Result;
 use clap::Parser;

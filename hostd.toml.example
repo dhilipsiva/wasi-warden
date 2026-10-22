@@ -19,6 +19,25 @@ api_base = "http://127.0.0.1:11434/v1"
 api_key = "ollama"
 model = "phi3.5"
 
+# Or several, in place of the endpoint above (docs/design/router.md): local ones are tried first, the
+# next on any failure, and paid ones (non-zero prices, per million tokens) only while llm_cost_micros
+# lasts.
+# [[llm.providers]]
+# name = "box"
+# tier = "local"
+# api_base = "http://127.0.0.1:11434/v1"
+# api_key = "ollama"
+# model = "qwen2.5-coder:7b"
+# timeout_ms = 30000
+# [[llm.providers]]
+# name = "frontier"
+# tier = "frontier"
+# api_base = "https://gateway.example/v1"
+# api_key = "..."
+# model = "claude-sonnet-5-5"
+# input_price = 2.0
+# output_price = 10.0
+
 # The run's budgets (the defaults shown). Each operation is paid for before it runs.
 # [budgets]
 # steps = 8                       # planner rounds
@@ -27,6 +46,7 @@ model = "phi3.5"
 # processes = 32
 # filesystem_ops = 10000
 # browser_actions = 200
+# llm_cost_micros = 1000000        # LLM spend at the providers' prices, in millionths of their unit
 # guest_fuel = 10000000000        # wasm work per round; 0 for no limit
 # guest_memory_bytes = 268435456  # the agent's memories and tables, together
 
@@ -46,6 +66,10 @@ model = "phi3.5"
 # digested, not recorded.
 # [audit]
 # path = "hostd-audit.jsonl"
+
+# One JSON line per LLM request attempt: provider, outcome, tokens, cost, latency (docs/design/telemetry.md).
+# [telemetry]
+# path = "hostd-telemetry.jsonl"
 
 # Browser tasks need a running WebDriver (Chromedriver, Geckodriver, ...).
 # [browser]

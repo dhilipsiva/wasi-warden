@@ -73,6 +73,21 @@ impl Audit {
         self.step.store(step, Ordering::Relaxed);
     }
 
+    /// The process's audit log, if one was installed.
+    pub fn current() -> Option<&'static Audit> {
+        CURRENT.get()
+    }
+
+    /// The run's id, shared with the telemetry.
+    pub fn run(&self) -> &str {
+        &self.run
+    }
+
+    /// The planner round in progress.
+    pub fn step(&self) -> u32 {
+        self.step.load(Ordering::Relaxed)
+    }
+
     /// Record one capability call.
     pub fn record(
         &self,

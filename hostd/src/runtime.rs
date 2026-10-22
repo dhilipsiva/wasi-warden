@@ -25,6 +25,7 @@ use crate::cli::StepArgs;
 use crate::config::HostConfig;
 use crate::registry;
 use crate::state::{HostState, OverMemory};
+use crate::telemetry::Telemetry;
 
 /// Run the plan-act loop for `args`. The loop blocks: wasmtime calls the component synchronously,
 /// the `llm` capability makes blocking HTTP requests, and the executor drives WebDriver futures with
@@ -178,6 +179,7 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
     let _ticker = EpochTicker::start(&engine);
 
     let audit = Audit::install(config.audit_path.as_deref(), config.secrets.clone())?;
+    Telemetry::install(config.telemetry_path.as_deref(), config.secrets.clone())?;
     let tools = registry::catalog().to_string();
     let observation_json = validate_json(&args.observation)?;
     let mut current_step = args.step;
