@@ -172,3 +172,23 @@ telemetry, not a forecast.
 
 Each fallback also adds the failed attempt's latency, up to its `timeout_ms`, before the frontier
 answers. A short local timeout bounds that delay.
+
+## Open questions
+
+These came over from wasmai unresolved:
+
+- **Where per-request confidence would come from.** Escalating on poor answers, not only failed ones,
+  needs a confidence signal, such as token log-probabilities. On wasmai's planned WASI-NN path the
+  inference runtime would have to expose them. Over HTTP, only endpoints that honour the OpenAI
+  `logprobs` option return them. Until one is chosen and measured, the router falls back on failure
+  only.
+- **Terms of service and consent for training on outputs.** wasmai planned to train org models on
+  frontier answers and on employees' sessions. Many providers' terms restrict using outputs to train
+  other models, and capturing people's sessions needs their notice and consent. The question is moot
+  while nothing trains on model outputs. It is recorded here in case that is ever reconsidered: check
+  each provider's terms and the people involved first.
+- **Buying vs building the local tier.** The local tier needs only an OpenAI-compatible
+  chat-completions server, and LlamaEdge's API server, llama.cpp's server and Ollama each provide one.
+  So wasi-warden builds no inference runtime of its own. An in-process WASI-NN path (wasmai's design,
+  with LlamaEdge's runtime) is worth revisiting only for a measured need, such as sandboxing the model
+  runtime itself.
