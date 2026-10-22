@@ -207,7 +207,10 @@ fn a_guest_that_burns_fuel_is_interrupted() {
     .expect("hostd stopped the guest within 30 s");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
-    assert!(stderr.contains("fuel"), "{stderr}");
+    assert!(
+        stderr.contains("ran out of fuel"),
+        "the out-of-fuel trap: {stderr}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

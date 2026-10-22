@@ -174,6 +174,9 @@ pub fn fake_webdriver() -> (u16, Requests) {
             ("POST", p) if p == format!("/session/{SESSION}/element") => {
                 serde_json::json!({ "element-6066-11e4-a52e-4f735466cecf": "fake-element-1" })
             }
+            ("POST", p) if p == format!("/session/{SESSION}/elements") => {
+                serde_json::json!([{ "element-6066-11e4-a52e-4f735466cecf": "fake-element-1" }])
+            }
             ("GET", p) if p == format!("/session/{SESSION}/element/fake-element-1/text") => {
                 serde_json::json!("fake text")
             }
