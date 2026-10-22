@@ -2,8 +2,9 @@
 //! the `llm` capability for a plan, this calls the fs and proc capabilities and WASI itself, through
 //! the real bindings, and records what each call returned in `results.json` in the workspace. The
 //! task is a JSON object: `mode` picks what to probe (`rules`, the default; `write_ops`; `policy`;
-//! `browser`; `input`; or `burn`, which loops forever), and the rest names the programs and URLs to
-//! try.
+//! `browser`; `browser_budget`; `downloads`; `input`; `burn`, which loops forever; `sleep`, which
+//! sleeps `ms` in WASI; or `grow`, which allocates `mib` MiB), and the rest names the programs and
+//! URLs to try.
 
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ mod bindings {
 
 use bindings::exports::osagent::agent::planner::{self, AgentError, CompletePlan, StepResponse};
 use bindings::osagent::browser::browser::{self, Selector, SelectorKind, SessionOptions};
-use bindings::osagent::common::types::AuditEvent;
+use bindings::osagent::common::types::{AuditEvent, CapabilityError, CapabilityErrorCode};
 use bindings::osagent::fs::fs::{self, DirHandle, FileOpenOptions};
 use bindings::osagent::input::input;
 use bindings::osagent::policy::policy::{self, BudgetKind, GrantRequest};
@@ -53,6 +54,25 @@ fn spawn_options(argv: &[&str], env: Vec<EnvVar>, timeout_ms: Option<u64>) -> Sp
 /// "refused" for an error, "allowed" otherwise.
 fn verdict<T, E>(r: &Result<T, E>) -> Value {
     json!(if r.is_ok() { "allowed" } else { "refused" })
+}
+
+/// "allowed", "limit" for a spent budget, or "refused: <why>" for any other refusal.
+fn budgeted<T>(r: &Result<T, CapabilityError>) -> Value {
+    match r {
+        Ok(_) => json!("allowed"),
+        Err(e) if matches!(e.code, CapabilityErrorCode::Limit) => json!("limit"),
+        Err(e) => json!(format!("refused: {}", e.message)),
+    }
+}
+
+fn append_only() -> FileOpenOptions {
+    FileOpenOptions {
+        read: false,
+        write: true,
+        append: true,
+        create: false,
+        truncate: false,
+    }
 }
 
 fn write_only() -> FileOpenOptions {
@@ -90,6 +110,15 @@ fn probe_writes(ws: &DirHandle) -> Map<String, Value> {
         outcome(&fs::rename(ws, "seed.txt", "moved.txt")),
     );
     out.insert("remove".into(), outcome(&fs::remove_file(ws, "other.txt")));
+    out.insert(
+        "remove_dir".into(),
+        outcome(&fs::remove_dir(ws, "keep-dir", true)),
+    );
+    let sized = fs::open_file(ws, "sized.txt", write_only()).and_then(|f| f.set_len(2048));
+    out.insert("set_len_big".into(), outcome(&sized));
+    // `near.txt` is planted just under the cap; an append is measured from its end.
+    let appended = fs::open_file(ws, "near.txt", append_only()).and_then(|f| f.write(&[b'y'; 100]));
+    out.insert("append_big".into(), outcome(&appended));
     out
 }
 
@@ -155,6 +184,23 @@ fn probe_policy() -> Map<String, Value> {
         "claim_huge".into(),
         outcome(&policy::claim_budget(BudgetKind::Processes, 1_000_000)),
     );
+    out.insert(
+        "claim_huge_code".into(),
+        budgeted(&policy::claim_budget(BudgetKind::Processes, 1_000_000)),
+    );
+    // Spawns until the process budget refuses one.
+    let mut spawned = 0;
+    let mut last = json!("allowed");
+    for _ in 0..10 {
+        let r = proc::spawn(&echo_path(), &spawn_options(&["x"], Vec::new(), None));
+        last = budgeted(&r);
+        if r.is_err() {
+            break;
+        }
+        spawned += 1;
+    }
+    out.insert("spawned".into(), json!(spawned));
+    out.insert("spawn_refused".into(), last);
     let grant = policy::request_capability(&GrantRequest {
         capability: "proc.spawn".into(),
         scope: Some("rm".into()),
@@ -173,6 +219,100 @@ fn probe_policy() -> Map<String, Value> {
         payload: "{}".into(),
     });
     out.insert("log_event".into(), outcome(&logged));
+    let big = policy::log_event(&AuditEvent {
+        event_type: "probe".into(),
+        step: Some(0),
+        payload: "x".repeat(8 * 1024),
+    });
+    out.insert("big_event".into(), outcome(&big));
+    // Events until the host refuses one.
+    let mut logged = 0;
+    let mut last = json!("allowed");
+    for _ in 0..2000 {
+        let r = policy::log_event(&AuditEvent {
+            event_type: "probe".into(),
+            step: Some(0),
+            payload: "{}".into(),
+        });
+        last = budgeted(&r);
+        if r.is_err() {
+            break;
+        }
+        logged += 1;
+    }
+    out.insert("events_logged".into(), json!(logged));
+    out.insert("events_refused".into(), last);
+    let grant = policy::request_capability(&GrantRequest {
+        capability: "proc.spawn".into(),
+        scope: None,
+        justification: "after the events ran out".into(),
+    });
+    out.insert("grant_after_events".into(), budgeted(&grant));
+    out
+}
+
+/// The `echo` the policy test allows.
+fn echo_path() -> String {
+    "echo".to_string()
+}
+
+/// The WIT browser against a small `browser_actions` budget: calls are paid for until it runs out,
+/// and then every browser call is refused with `limit`.
+fn probe_browser_budget(task: &Value) -> Map<String, Value> {
+    let url = task["allowed"].as_str().unwrap_or_default().to_string();
+    let mut out = Map::new();
+    let options = SessionOptions {
+        profile: None,
+        headless: true,
+        allow_downloads: false,
+    };
+    let session = match browser::open_session(&options) {
+        Ok(s) => s,
+        Err(e) => {
+            out.insert("open".into(), json!(format!("refused: {}", e.message)));
+            return out;
+        }
+    };
+    let selector = Selector {
+        kind: SelectorKind::Css,
+        value: "#greeting".into(),
+    };
+    let element = session.find(&selector, Some(0));
+    out.insert("find".into(), budgeted(&element));
+    let mut visits = 0;
+    let mut last = json!("allowed");
+    for _ in 0..10 {
+        let r = session.goto(&url, Some(0));
+        last = budgeted(&r);
+        if r.is_err() {
+            break;
+        }
+        visits += 1;
+    }
+    out.insert("visits".into(), json!(visits));
+    out.insert("goto_refused".into(), last);
+    if let Ok(element) = element {
+        out.insert("click_after".into(), budgeted(&element.click()));
+        out.insert("text_after".into(), budgeted(&element.inner_text()));
+    }
+    session.close();
+    out
+}
+
+/// A session that asks for downloads. Its workspace is read-only in the test, so the outcome comes
+/// back as the step's error rather than in `results.json`.
+fn probe_downloads() -> Map<String, Value> {
+    let options = SessionOptions {
+        profile: None,
+        headless: true,
+        allow_downloads: true,
+    };
+    let mut out = Map::new();
+    let session = browser::open_session(&options);
+    out.insert("open_with_downloads".into(), outcome(&session));
+    if let Ok(session) = session {
+        session.close();
+    }
     out
 }
 
@@ -237,6 +377,21 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
         "write_ops" => return probe_writes(ws),
         "policy" => return probe_policy(),
         "browser" => return probe_browser(&task),
+        "browser_budget" => return probe_browser_budget(&task),
+        "sleep" => {
+            // Blocks in a WASI clock call, where no epoch can interrupt it.
+            std::thread::sleep(Duration::from_millis(task["ms"].as_u64().unwrap_or(0)));
+            let mut out = Map::new();
+            out.insert("slept".into(), json!(true));
+            return out;
+        }
+        "grow" => {
+            let mib = task["mib"].as_u64().unwrap_or(0) as usize;
+            let grown = std::hint::black_box(vec![7u8; mib << 20]);
+            let mut out = Map::new();
+            out.insert("grew".into(), json!(grown.len()));
+            return out;
+        }
         "input" => {
             let mut out = Map::new();
             out.insert("key_sequence".into(), outcome(&input::key_sequence("x")));
@@ -412,6 +567,9 @@ impl planner::Guest for Probe {
             retryable: false,
             message,
         };
+        if task.contains("\"downloads\"") {
+            return Err(fail(Value::Object(probe_downloads()).to_string()));
+        }
         let ws = fs::open_workspace().map_err(|e| fail(e.message))?;
         let results = Value::Object(probe(&task, &ws)).to_string();
         let options = FileOpenOptions {

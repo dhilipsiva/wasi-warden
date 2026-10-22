@@ -220,21 +220,26 @@ fn a_guest_that_burns_fuel_is_interrupted() {
 fn a_guest_past_its_wall_clock_budget_is_interrupted() {
     let (root, _ws, config) = probe_setup(
         "wallclock",
-        "[budgets]\nguest_fuel = 0\nwallclock_ms = 500\n",
+        // Well past the time compiling the component takes, so the guest is running when the
+        // budget ends and the epoch interrupt is what stops it.
+        "[budgets]\nguest_fuel = 0\nwallclock_ms = 8000\n",
     );
     let started = std::time::Instant::now();
     let out = support::run_step_within(
         &support::probe_component(),
         &config,
         r#"{"mode":"burn"}"#,
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(60),
     )
-    .expect("hostd stopped the guest within 30 s");
+    .expect("hostd stopped the guest within 60 s");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
-    assert!(stderr.contains("wall-clock"), "{stderr}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
+        stderr.contains("interrupted at the wall-clock budget"),
+        "{stderr}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );
@@ -245,6 +250,7 @@ fn a_guest_past_its_wall_clock_budget_is_interrupted() {
 #[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
 fn a_read_only_workspace_refuses_every_write() {
     let (root, ws, config) = probe_setup("readonly", "[workspace]\nread_only = true\n");
+    std::fs::create_dir(ws.join("keep-dir")).expect("keep-dir");
     // The probe writes its results itself, so a read-only run reports through stderr instead.
     let out = support::run_step_with(
         &support::probe_component(),
@@ -258,7 +264,9 @@ fn a_read_only_workspace_refuses_every_write() {
     );
     assert!(stderr.contains("read-only"), "{stderr}");
     assert!(
-        ws.join("seed.txt").exists() && ws.join("other.txt").exists(),
+        ws.join("seed.txt").exists()
+            && ws.join("other.txt").exists()
+            && ws.join("keep-dir").exists(),
         "nothing moved or removed"
     );
     assert!(
@@ -272,7 +280,24 @@ fn a_read_only_workspace_refuses_every_write() {
 #[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
 fn writes_past_max_file_bytes_are_refused() {
     let (root, ws, config) = probe_setup("maxfile", "[workspace]\nmax_file_bytes = 1024\n");
+    std::fs::write(ws.join("near.txt"), vec![b'n'; 1000]).expect("near.txt");
     let results = probe_results(&config, &ws, serde_json::json!({ "mode": "write_ops" }));
+    for key in ["set_len_big", "append_big"] {
+        assert!(
+            results[key]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("refused"),
+            "{key}: {results}"
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(ws.join("near.txt"))
+            .expect("near.txt")
+            .len(),
+        1000,
+        "the append did not land"
+    );
     assert_eq!(results["small_write"], "allowed", "{results}");
     assert!(
         results["big_write"]
@@ -320,6 +345,28 @@ fn the_policy_capability_reports_and_enforces_the_budgets() {
         "no grant is configured, so none is approved"
     );
     assert_eq!(results["log_event"], "allowed");
+    assert_eq!(
+        results["claim_huge_code"], "limit",
+        "a spent budget is a limit: {results}"
+    );
+    assert_eq!(results["spawned"], 4, "each spawn is paid for: {results}");
+    assert_eq!(results["spawn_refused"], "limit", "{results}");
+    assert!(
+        results["big_event"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("refused"),
+        "an oversized event is refused: {results}"
+    );
+    assert!(
+        results["events_logged"].as_u64().is_some_and(|n| n < 2000),
+        "events are capped: {results}"
+    );
+    assert_eq!(results["events_refused"], "limit", "{results}");
+    assert_eq!(
+        results["grant_after_events"], "limit",
+        "grant requests count as events: {results}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -380,5 +427,101 @@ fn input_is_refused_as_disabled() {
         verdict.starts_with("refused") && verdict.contains("disabled"),
         "{verdict}"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A guest blocked in a WASI sleep, where no epoch can interrupt it, does not outlast the wall-clock
+/// budget: the host ends the run shortly after the budget does.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn a_guest_asleep_in_wasi_is_stopped_at_the_wall_clock_budget() {
+    let (root, _ws, config) = probe_setup("sleep", "[budgets]\nwallclock_ms = 3000\n");
+    let started = std::time::Instant::now();
+    let out = support::run_step_within(
+        &support::probe_component(),
+        &config,
+        r#"{"mode":"sleep","ms":120000}"#,
+        std::time::Duration::from_secs(60),
+    )
+    .expect("hostd ended the run within 60 s");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("wall-clock"), "{stderr}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A guest that allocates past `guest_memory_bytes` is stopped, with the budget named.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn a_guest_past_its_memory_budget_is_stopped() {
+    let (root, _ws, config) = probe_setup("memory", "[budgets]\nguest_memory_bytes = 33554432\n");
+    let out = support::run_step_with(
+        &support::probe_component(),
+        &config,
+        r#"{"mode":"grow","mib":64}"#,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("guest_memory_bytes"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The WIT browser pays for each call from `browser_actions`; once it is spent, every browser call
+/// is refused with `limit`.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn the_wit_browser_spends_the_browser_budget() {
+    let (port, _seen) = support::fake_webdriver();
+    let (root, ws, config) = probe_setup(
+        "browserbudget",
+        &format!(
+            "[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = [\"login.example.test\"]\n[budgets]\nbrowser_actions = 5\n"
+        ),
+    );
+    let results = probe_results(
+        &config,
+        &ws,
+        serde_json::json!({ "mode": "browser_budget", "allowed": "http://login.example.test/" }),
+    );
+    assert_eq!(results["find"], "allowed", "{results}");
+    assert!(
+        results["visits"].as_u64().is_some_and(|n| n < 5),
+        "the visits were paid for: {results}"
+    );
+    for key in ["goto_refused", "click_after", "text_after"] {
+        assert_eq!(results[key], "limit", "{key}: {results}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A read-only workspace refuses a browser session that would download into it.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn a_read_only_workspace_refuses_downloads() {
+    let (port, _seen) = support::fake_webdriver();
+    let (root, ws, config) = probe_setup(
+        "downloads",
+        &format!(
+            "[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = []\n[workspace]\nread_only = true\n"
+        ),
+    );
+    // The probe reports through its step error: it cannot write results.json here.
+    let out = support::run_step_with(
+        &support::probe_component(),
+        &config,
+        r#"{"mode":"downloads"}"#,
+    );
+    let _ = ws;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("open_with_downloads") && stderr.contains("refused"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("read-only"), "{stderr}");
     let _ = std::fs::remove_dir_all(&root);
 }

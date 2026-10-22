@@ -121,6 +121,21 @@ pub fn fake_llm_costing(
     plans: Vec<serde_json::Value>,
     tokens: u32,
 ) -> (u16, Arc<Mutex<Vec<String>>>) {
+    fake_llm_reporting(
+        plans,
+        Some(serde_json::json!({
+            "prompt_tokens": tokens / 2,
+            "completion_tokens": tokens - tokens / 2,
+            "total_tokens": tokens
+        })),
+    )
+}
+
+/// Like [`fake_llm`], with `usage` as each response's usage report (`None`: no report).
+pub fn fake_llm_reporting(
+    plans: Vec<serde_json::Value>,
+    usage: Option<serde_json::Value>,
+) -> (u16, Arc<Mutex<Vec<String>>>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     let port = serve(move |_method, _path, body| {
@@ -130,14 +145,16 @@ pub fn fake_llm_costing(
             seen.len()
         };
         let plan = &plans[(n - 1).min(plans.len() - 1)];
-        serde_json::json!({
+        let mut response = serde_json::json!({
             "choices": [{
                 "message": { "role": "assistant", "content": plan.to_string() },
                 "finish_reason": "stop"
-            }],
-            "usage": { "prompt_tokens": tokens / 2, "completion_tokens": tokens - tokens / 2, "total_tokens": tokens }
-        })
-        .to_string()
+            }]
+        });
+        if let Some(usage) = &usage {
+            response["usage"] = usage.clone();
+        }
+        response.to_string()
     });
     (port, seen)
 }
@@ -252,10 +269,35 @@ pub fn run_step_within(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().expect("run hostd");
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
     let deadline = std::time::Instant::now() + limit;
     loop {
-        if child.try_wait().expect("wait").is_some() {
-            return Some(child.wait_with_output().expect("output"));
+        if let Some(status) = child.try_wait().expect("wait") {
+            return Some(Output {
+                status,
+                stdout: stdout.join().expect("stdout"),
+                stderr: stderr.join().expect("stderr"),
+            });
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();

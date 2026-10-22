@@ -36,6 +36,11 @@ fn a_step_lists_the_workspace_and_completes() {
     let out = support::run_step(&config, "List workspace files");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "hostd failed:\n{stderr}");
+    assert!(
+        out.stdout.is_empty() && stderr.contains("planner completed task"),
+        "the log lines go to stderr: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 
     let seen = seen.lock().expect("log");
     assert_eq!(seen.len(), 2, "two planner rounds: {seen:?}");
@@ -239,6 +244,26 @@ fn the_process_and_filesystem_budgets_refuse_extra_operations() {
             .unwrap_or_default()
             .contains("budget"),
         "{actions}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An endpoint that reports no usage is charged an estimate, so the token budget still holds.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn the_token_budget_holds_without_a_usage_report() {
+    let (port, seen) = support::fake_llm_reporting(
+        never_completes(serde_json::json!([{ "capability": "fs.list_dir", "input": {} }])),
+        None,
+    );
+    let (root, config) = setup("nousage", port, "[budgets]\nllm_tokens = 1000\n");
+    let out = support::run_step(&config, "Spend tokens");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("token budget"), "{stderr}");
+    assert!(
+        seen.lock().expect("log").len() < 8,
+        "the token budget, not the step budget, ended the run"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
