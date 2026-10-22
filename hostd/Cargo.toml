@@ -25,7 +25,7 @@ sha2 = "0.10"
 wasmtime = { version = "49.0.4", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "backtrace", "demangle", "anyhow", "parallel-compilation"] }
 wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
 ureq = { version = "2.10.0", default-features = false, features = ["tls", "json"] }
-base64 = "0.22"
+base64 = "0.23"
 # Kill a timed-out process group (sandbox::run_bounded) without unsafe code.
 rustix = { version = "1", features = ["process"] }
 # Parse URLs for the browser host allowlist (sandbox::check_navigation).
