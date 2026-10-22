@@ -436,7 +436,8 @@ fn input_is_refused_as_disabled() {
 #[test]
 #[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
 fn a_guest_asleep_in_wasi_is_stopped_at_the_wall_clock_budget() {
-    let (root, _ws, config) = probe_setup("sleep", "[budgets]\nwallclock_ms = 3000\n");
+    // Well past compiling the component, even under load: the guest is asleep when the budget ends.
+    let (root, _ws, config) = probe_setup("sleep", "[budgets]\nwallclock_ms = 8000\n");
     let started = std::time::Instant::now();
     let out = support::run_step_within(
         &support::probe_component(),
@@ -447,9 +448,12 @@ fn a_guest_asleep_in_wasi_is_stopped_at_the_wall_clock_budget() {
     .expect("hostd ended the run within 60 s");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
-    assert!(stderr.contains("wall-clock"), "{stderr}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(30),
+        stderr.contains("inside a host call"),
+        "the watchdog ended it: {stderr}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(40),
         "{:?}",
         started.elapsed()
     );
@@ -584,7 +588,7 @@ fn a_process_gets_no_more_than_the_run_has_left() {
     let sleep = which("sleep");
     let (root, _ws, config) = probe_setup(
         "longspawn",
-        &format!("allow_proc = [{sleep:?}]\n[budgets]\nwallclock_ms = 3000\n"),
+        &format!("allow_proc = [{sleep:?}]\n[budgets]\nwallclock_ms = 8000\n"),
     );
     let task = serde_json::json!({ "mode": "long_spawn", "sleep": sleep });
     let out = support::run_step_within(

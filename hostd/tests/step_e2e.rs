@@ -277,7 +277,8 @@ fn actions_stop_at_the_wall_clock_budget() {
         { "capability": "proc.spawn", "input": { "command": "sleep", "args": ["30"] } },
         { "capability": "proc.spawn", "input": { "command": "echo", "args": ["late"] } }
     ])));
-    let (root, config) = setup("wallclock", port, "[budgets]\nwallclock_ms = 3000\n");
+    // Well past compiling the component, even under load, so the plan runs before the budget ends.
+    let (root, config) = setup("wallclock", port, "[budgets]\nwallclock_ms = 10000\n");
     let text = std::fs::read_to_string(&config)
         .unwrap()
         .replace("allow_proc = []", "allow_proc = [\"sleep\", \"echo\"]");
@@ -285,6 +286,10 @@ fn actions_stop_at_the_wall_clock_budget() {
     let out = support::run_step(&config, "Wait");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
+    assert!(
+        stderr.contains("planner requested capability executions"),
+        "the plan ran: {stderr}"
+    );
     assert!(
         !stderr.contains("inside a host call"),
         "the process stopped at the budget, before the watchdog: {stderr}"
