@@ -2,6 +2,8 @@
 members = [ "agent-core",
     "hostd",
     "tools/wit-check",
+    # A test guest for the end-to-end tests (hostd/tests/probe_e2e.rs).
+    "tests/probe-agent",
 ]
 resolver = "2"
 

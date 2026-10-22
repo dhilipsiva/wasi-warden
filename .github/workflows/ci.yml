@@ -40,8 +40,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # A step against a scripted LLM; a browser session against a fake WebDriver.
-        test: [step_e2e, browser_e2e]
+        # A step against a scripted LLM; browser sessions against a fake WebDriver; the probe guest
+        # calling the WIT capabilities and WASI directly.
+        test: [step_e2e, browser_e2e, probe_e2e]
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

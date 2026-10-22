@@ -14,16 +14,29 @@ pub fn component() -> PathBuf {
     if let Some(path) = std::env::var_os("AGENT_CORE_WASM") {
         return PathBuf::from(path);
     }
+    release_wasm("agent_core", "agent-core")
+}
+
+/// The probe test guest (tests/probe-agent): `PROBE_AGENT_WASM`, or its release build.
+pub fn probe_component() -> PathBuf {
+    if let Some(path) = std::env::var_os("PROBE_AGENT_WASM") {
+        return PathBuf::from(path);
+    }
+    release_wasm("probe_agent", "probe-agent")
+}
+
+/// `<target>/wasm32-wasip2/release/<file>.wasm` for this test's target directory.
+fn release_wasm(file: &str, package: &str) -> PathBuf {
     // <target>/debug/deps/<test>-<hash> -> <target>
     let exe = std::env::current_exe().expect("current exe");
     let target = exe
         .ancestors()
         .nth(3)
         .expect("the target directory above debug/deps");
-    let path = target.join("wasm32-wasip2/release/agent_core.wasm");
+    let path = target.join(format!("wasm32-wasip2/release/{file}.wasm"));
     assert!(
         path.exists(),
-        "{} is missing: cargo build -p agent-core --target wasm32-wasip2 --release",
+        "{} is missing: cargo build -p {package} --target wasm32-wasip2 --release",
         path.display()
     );
     path
@@ -147,7 +160,13 @@ pub fn fake_webdriver() -> (u16, Requests) {
             ("POST", p) if p == session_url => {
                 let sent: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
                 if let Some(u) = sent["url"].as_str() {
-                    *url.lock().expect("url") = u.to_string();
+                    // A page on `redirect.example.test` sends the browser somewhere else.
+                    let landed = if u.contains("redirect.example.test") {
+                        "http://elsewhere.invalid/"
+                    } else {
+                        u
+                    };
+                    *url.lock().expect("url") = landed.to_string();
                 }
                 serde_json::Value::Null
             }
@@ -159,7 +178,8 @@ pub fn fake_webdriver() -> (u16, Requests) {
     (port, seen)
 }
 
-/// A `hostd.toml` for `workspace`, the LLM on `llm_port`, and a WebDriver on `webdriver_port`.
+/// A `hostd.toml` for `workspace`, the LLM on `llm_port`, and a WebDriver on `webdriver_port` that
+/// may visit `login.example.test` and `redirect.example.test`.
 pub fn write_config(path: &Path, workspace: &Path, llm_port: u16, webdriver_port: Option<u16>) {
     let mut config = format!(
         "workspace_root = {:?}\nallow_proc = []\n\n[llm]\napi_base = \"http://127.0.0.1:{llm_port}/v1\"\napi_key = \"test\"\nmodel = \"scripted\"\n",
@@ -167,22 +187,37 @@ pub fn write_config(path: &Path, workspace: &Path, llm_port: u16, webdriver_port
     );
     if let Some(port) = webdriver_port {
         config.push_str(&format!(
-            "\n[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\n"
+            "\n[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = [\"login.example.test\", \"redirect.example.test\"]\n"
         ));
     }
     std::fs::write(path, config).expect("config");
 }
 
-/// Run `hostd step` for `task` with the component and `config`.
+/// Run `hostd step` for `task` with the agent component and `config`.
 pub fn run_step(config: &Path, task: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_hostd"))
-        .arg("step")
+    run_step_with(&component(), config, task)
+}
+
+/// Run `hostd step` for `task` with `component` and `config`.
+pub fn run_step_with(component: &Path, config: &Path, task: &str) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hostd"));
+    cmd.arg("step")
         .arg("--component")
-        .arg(component())
+        .arg(component)
         .arg("--config")
         .arg(config)
         .args(["--task", task, "--observation", "{}"])
-        .env("RUST_LOG", "info")
-        .output()
-        .expect("run hostd")
+        .env("RUST_LOG", "info");
+    // The fake servers are on loopback; a proxy from the environment would intercept them.
+    for var in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.output().expect("run hostd")
 }

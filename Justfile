@@ -33,13 +33,13 @@ deny:
 wit:
     cargo run --locked -p wit-check
 
-# The agent component (WASI Preview 2) that hostd loads.
+# The WASI Preview 2 components: the agent hostd loads, and the probe guest the end-to-end tests use.
 wasm:
-    cargo build --locked -p agent-core --target wasm32-wasip2 --release
+    cargo build --locked -p agent-core -p probe-agent --target wasm32-wasip2 --release
 
-# One end-to-end test (step_e2e or browser_e2e) against the freshly built component.
+# One end-to-end test (step_e2e, browser_e2e or probe_e2e) against freshly built components.
 e2e name: wasm
     cargo test --locked -p hostd --test {{ name }} -- --include-ignored
 
 # Everything CI checks.
-ci: lint test doc deny wit (e2e "step_e2e") (e2e "browser_e2e")
+ci: lint test doc deny wit (e2e "step_e2e") (e2e "browser_e2e") (e2e "probe_e2e")

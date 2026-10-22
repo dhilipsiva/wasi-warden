@@ -62,9 +62,104 @@ fn a_browser_session_opens_navigates_and_quits() {
         wd.iter().any(|(m, p, _)| m == "DELETE" && *p == session),
         "the session was quit when the step ended: {wd:?}"
     );
+    let created = wd
+        .iter()
+        .find(|(m, p, _)| m == "POST" && p == "/session")
+        .map(|(_, _, b)| b.clone())
+        .unwrap_or_default();
+    assert!(
+        !created.contains("--no-sandbox"),
+        "Chrome keeps its sandbox by default: {created}"
+    );
     let llm = llm_seen.lock().expect("llm log");
     assert_eq!(llm.len(), 2, "two planner rounds");
     let reported = llm[1].contains(target) && llm[1].contains("browser.session.goto");
     assert!(reported, "the second round saw the navigation: {}", llm[1]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Navigation is confined to the configured hosts: a host off the list and a non-web scheme never
+/// reach the WebDriver, and a page that redirects off the list is left for `about:blank`.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn navigation_stays_inside_the_host_allowlist() {
+    let root = support::scratch_dir("allowlist");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let goto = |url: &str| {
+        serde_json::json!({
+            "capability": "browser.session.goto",
+            "input": { "session": "s1", "url": url, "timeout_ms": 0 }
+        })
+    };
+    let (llm_port, llm_seen) = support::fake_llm(vec![
+        serde_json::json!({
+            "status": "continue",
+            "thought": "try four pages",
+            "actions": [
+                { "capability": "browser.open_session", "input": { "alias": "s1" } },
+                goto("http://evil.example.test/"),
+                goto("file:///etc/passwd"),
+                goto("http://login.example.test/"),
+                goto("http://redirect.example.test/"),
+            ]
+        }),
+        serde_json::json!({
+            "status": "complete",
+            "thought": "done",
+            "actions": [],
+            "result": {},
+            "reason": "done"
+        }),
+    ]);
+    let (wd_port, wd_seen) = support::fake_webdriver();
+    let config = root.join("hostd.toml");
+    support::write_config(&config, &workspace, llm_port, Some(wd_port));
+
+    let out = support::run_step(&config, "Visit the pages");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "hostd failed:\n{stderr}");
+
+    let wd = wd_seen.lock().expect("webdriver log");
+    let sent: Vec<&str> = wd
+        .iter()
+        .filter(|(m, p, _)| m == "POST" && p.ends_with("/url"))
+        .map(|(_, _, b)| b.as_str())
+        .collect();
+    assert!(
+        !sent
+            .iter()
+            .any(|b| b.contains("evil.example.test") || b.contains("file://")),
+        "refused URLs never reached the WebDriver: {sent:?}"
+    );
+    assert!(
+        sent.iter().any(|b| b.contains("login.example.test")),
+        "an allowed host was visited: {sent:?}"
+    );
+    assert!(
+        sent.last().is_some_and(|b| b.contains("about:blank")),
+        "the redirect off the list was left for about:blank: {sent:?}"
+    );
+    let llm = llm_seen.lock().expect("llm log");
+    let report: serde_json::Value = serde_json::from_str(&llm[1]).expect("request JSON");
+    let content = report["messages"][1]["content"]
+        .as_str()
+        .unwrap_or_default();
+    let data = content
+        .split_once("Observation data: ")
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let observed: serde_json::Value = serde_json::from_str(data).expect("observation JSON");
+    let ok: Vec<bool> = observed["actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .map(|a| a["success"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(
+        ok,
+        [true, false, false, true, false],
+        "which gotos succeeded"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

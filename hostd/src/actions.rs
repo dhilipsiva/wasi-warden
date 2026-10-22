@@ -681,10 +681,8 @@ mod tests {
         assert!(ensure_within_workspace(root, Utf8Path::new("/work/sandbox/inner")).is_ok());
     }
 
-    /// Known gap (README, Status): the check is lexical, so a symlink inside the workspace that points
-    /// out of it is followed.
+    /// A symlink inside the workspace that points out of it is not followed.
     #[test]
-    #[ignore = "known gap: the workspace check is lexical and follows symlinks out of the workspace"]
     fn a_symlink_out_of_the_workspace_is_refused() {
         let root = scratch("symlink");
         let outside = scratch("outside");
@@ -702,6 +700,62 @@ mod tests {
             "read through a symlink: {:?}",
             report.output
         );
+        let listed = run(&root, &[], "fs.list_dir", json!({ "path": "escape" }));
+        assert!(
+            !listed.success,
+            "listed through a symlink: {:?}",
+            listed.output
+        );
+    }
+
+    /// A dangling symlink cannot be checked, so it is refused (a later target could be anywhere).
+    #[test]
+    fn a_dangling_symlink_is_refused() {
+        let root = scratch("dangling");
+        let outside = scratch("gone");
+        std::os::unix::fs::symlink(
+            outside.join("not-yet").as_std_path(),
+            root.join("later").as_std_path(),
+        )
+        .unwrap();
+        let report = run(&root, &[], "fs.read_file", json!({ "path": "later" }));
+        assert!(!report.success);
+    }
+
+    /// A symlink that stays inside the workspace is followed.
+    #[test]
+    fn a_symlink_inside_the_workspace_is_followed() {
+        let root = scratch("inside");
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("real/file.txt"), "inside").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("real").as_std_path(),
+            root.join("alias").as_std_path(),
+        )
+        .unwrap();
+        let report = run(
+            &root,
+            &[],
+            "fs.read_file",
+            json!({ "path": "alias/file.txt" }),
+        );
+        assert_eq!(report.output["contents"], "inside", "{:?}", report.error);
+    }
+
+    /// An unbounded `max_bytes` is capped at 1 MiB, not overflowed.
+    #[test]
+    fn an_unbounded_max_bytes_is_capped() {
+        let root = scratch("maxbytes");
+        fs::write(root.join("big.bin"), vec![b'a'; (1 << 20) + 10]).unwrap();
+        let report = run(
+            &root,
+            &[],
+            "fs.read_file",
+            json!({ "path": "big.bin", "max_bytes": u64::MAX }),
+        );
+        assert!(report.success, "{:?}", report.error);
+        assert_eq!(report.output["contents"].as_str().unwrap().len(), 1 << 20);
+        assert_eq!(report.output["truncated"], true);
     }
 
     // ── fs actions ──────────────────────────────────────────────────────────
@@ -827,10 +881,9 @@ mod tests {
         );
     }
 
-    /// Known gap (README, Status): the allowlist matches a command's base name, so any program named
-    /// like an allowed one runs.
+    /// The allowlist names programs, not base names: a program planted elsewhere under an allowed
+    /// name does not run.
     #[test]
-    #[ignore = "known gap: the allowlist matches base names, so /any/dir/ls passes for `ls`"]
     fn the_allowlist_matches_the_resolved_program_not_its_base_name() {
         let root = scratch("basename");
         let fake = root.join("pwd");
@@ -847,10 +900,10 @@ mod tests {
         assert!(!report.success, "a planted `pwd` ran: {:?}", report.output);
     }
 
-    /// Known gap (README, Status): loader variables from the plan reach the spawned process.
+    /// Loader variables from the plan are refused: they would let the plan inject code into an
+    /// allowed program.
     #[test]
-    #[ignore = "known gap: plan-supplied LD_* variables reach the spawned process"]
-    fn loader_variables_from_the_plan_are_dropped() {
+    fn loader_variables_from_the_plan_are_refused() {
         let root = scratch("ld");
         let env = which("env");
         let report = run(
@@ -859,8 +912,72 @@ mod tests {
             "proc.spawn",
             json!({ "command": env, "env": [{ "key": "LD_PRELOAD", "value": "/tmp/x.so" }] }),
         );
-        let stdout = report.output["stdout"].as_str().unwrap_or_default();
-        assert!(!stdout.contains("LD_PRELOAD"), "{stdout}");
+        assert!(!report.success, "LD_PRELOAD passed: {:?}", report.output);
+        let dyld = run(
+            &root,
+            &[env.as_str()],
+            "proc.spawn",
+            json!({ "command": env, "env": [{ "key": "DYLD_INSERT_LIBRARIES", "value": "x" }] }),
+        );
+        assert!(!dyld.success);
+    }
+
+    #[test]
+    fn a_command_past_its_timeout_is_killed() {
+        let root = scratch("timeout");
+        let sleep = which("sleep");
+        let started = std::time::Instant::now();
+        let report = run(
+            &root,
+            &[sleep.as_str()],
+            "proc.spawn",
+            json!({ "command": sleep, "args": ["30"], "timeout_ms": 200 }),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "killed promptly"
+        );
+        assert_eq!(
+            report.output["timed_out"], true,
+            "{:?} {:?}",
+            report.output, report.error
+        );
+    }
+
+    /// The timeout kills the whole process group, so a child the command started cannot hold the
+    /// step open.
+    #[test]
+    fn a_timeout_kills_the_commands_children_too() {
+        let root = scratch("group");
+        let sh = which("sh");
+        let started = std::time::Instant::now();
+        let report = run(
+            &root,
+            &[sh.as_str()],
+            "proc.spawn",
+            json!({ "command": sh, "args": ["-c", "sleep 30 & sleep 30"], "timeout_ms": 200 }),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the group was killed"
+        );
+        assert_eq!(report.output["timed_out"], true);
+    }
+
+    #[test]
+    fn a_commands_output_is_capped() {
+        let root = scratch("cap");
+        let seq = which("seq");
+        let report = run(
+            &root,
+            &[seq.as_str()],
+            "proc.spawn",
+            json!({ "command": seq, "args": ["1", "1000000"] }),
+        );
+        assert!(report.success, "{:?}", report.error);
+        assert_eq!(report.output["status"], 0);
+        assert_eq!(report.output["stdout"].as_str().unwrap().len(), 1 << 20);
+        assert_eq!(report.output["stdout_truncated"], true);
     }
 
     /// The absolute path of `program` on this machine's PATH.

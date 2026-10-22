@@ -1456,6 +1456,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "probe-agent"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
