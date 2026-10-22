@@ -433,7 +433,7 @@ impl ActionExecutor {
             let driver = driver.clone();
             async move { driver.current_url().await.map(|u| u.to_string()) }
         })?;
-        if current == "about:blank" {
+        if sandbox::is_blank_page(&current) {
             return Ok(());
         }
         if let Err(why) = sandbox::check_navigation(&current, allowed) {

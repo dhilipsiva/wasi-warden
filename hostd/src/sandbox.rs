@@ -254,11 +254,10 @@ pub fn admit<'a>(allowed: &'a [AllowedProgram], requested: &str) -> Option<&'a P
         .map(|a| a.path.as_path())
 }
 
-/// Variables no plan may set even when the operator lists them: the dynamic loader's, the child's
-/// `PATH` (the host sets it), and the hooks shells and interpreters run code from.
-const NEVER_FROM_THE_PLAN: [&str; 16] = [
+/// Names no plan may set even when the operator lists them: the child's `PATH` (the host sets it)
+/// and the hooks the C library and shells read code or configuration from.
+const NEVER_FROM_THE_PLAN: [&str; 9] = [
     "PATH",
-    "BASH_ENV",
     "ENV",
     "IFS",
     "SHELLOPTS",
@@ -266,29 +265,36 @@ const NEVER_FROM_THE_PLAN: [&str; 16] = [
     "GCONV_PATH",
     "GLIBC_TUNABLES",
     "LOCPATH",
-    "NODE_OPTIONS",
-    "PYTHONPATH",
-    "PYTHONHOME",
-    "PYTHONSTARTUP",
-    "PERL5LIB",
-    "PERL5OPT",
-    "RUBYOPT",
+    "GIT_ASKPASS",
+];
+
+/// Prefixes no plan may set either: the dynamic loader's (`LD_`, `DYLD_`), the shell's (`BASH`:
+/// exported functions, `BASH_ENV`, `BASHOPTS`), the interpreters' search paths and startup hooks
+/// (`PYTHON`, `PERL`, `RUBY`, `NODE_`), and git's config injection (`GIT_CONFIG`, `GIT_SSH`,
+/// `GIT_EXEC`).
+const NEVER_PREFIXES: [&str; 11] = [
+    "LD_",
+    "DYLD_",
+    "BASH",
+    "PYTHON",
+    "PERL",
+    "RUBY",
+    "NODE_",
+    "GIT_CONFIG",
+    "GIT_SSH",
+    "GIT_EXEC",
+    "GIT_ALTERNATE",
 ];
 
 /// Whether the plan may set `key` in a spawned process's environment: only names on the operator's
-/// `allowed` list, and never the loader's (`LD_*`, `DYLD_*`), exported shell functions
-/// (`BASH_FUNC_*`), git's config injection (`GIT_CONFIG*`, `GIT_SSH*`, `GIT_ASKPASS`,
-/// `GIT_EXEC_PATH`) or [`NEVER_FROM_THE_PLAN`]. An empty name, or one holding `=` or NUL, is
-/// malformed.
+/// `allowed` list, and never [`NEVER_FROM_THE_PLAN`] or a name starting with one of
+/// [`NEVER_PREFIXES`]. An empty name, or one holding `=` or NUL, is malformed.
 pub fn check_env_key(key: &str, allowed: &[String]) -> Result<(), String> {
     if key.is_empty() || key.contains('=') || key.contains('\0') {
         return Err(format!("environment variable name `{key}` is malformed"));
     }
     let never = NEVER_FROM_THE_PLAN.contains(&key)
-        || ["LD_", "DYLD_", "BASH_FUNC_", "GIT_CONFIG", "GIT_SSH"]
-            .iter()
-            .any(|prefix| key.starts_with(prefix))
-        || matches!(key, "GIT_ASKPASS" | "GIT_EXEC_PATH");
+        || NEVER_PREFIXES.iter().any(|prefix| key.starts_with(prefix));
     if never {
         return Err(format!("environment variable `{key}` is not allowed"));
     }
@@ -429,8 +435,15 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration) -> io::Result<Bounded> {
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     loop {
-        if exited(pid)? {
-            break;
+        match exited(pid) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(err) => {
+                // Never leave the group running behind an error.
+                let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+                let _ = child.wait();
+                return Err(err);
+            }
         }
         if Instant::now() >= deadline {
             timed_out = true;
@@ -453,6 +466,12 @@ pub fn run_bounded(mut cmd: Command, timeout: Duration) -> io::Result<Bounded> {
         stderr_truncated: err.truncated,
         timed_out,
     })
+}
+
+/// Whether `url` is a page with nothing on it: `about:blank`, or `data:,` (where chromedriver starts
+/// a session).
+pub fn is_blank_page(url: &str) -> bool {
+    url == "about:blank" || url == "data:,"
 }
 
 /// Whether the browser may go to `url`: http or https only, to a host on `allowed` (exactly, or

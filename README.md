@@ -140,7 +140,13 @@ What does not work yet:
     handle included. But the check and the use are separate calls, so a process swapping a directory for a
     symlink in between could still escape. Only an allowlisted program running alongside could do that.
     Hard links into the workspace are followed.
-  * **Processes.** A process that leaves its process group (`setsid`, a daemon) is not killed with it.
+  * **Processes.** A process that leaves its process group (`setsid`, a daemon) is not killed with it. The
+    parent-death signal does not survive exec of a setuid, setgid or file-capability program (such as those
+    under NixOS's `/run/wrappers`), so do not allowlist one.
+  * **Allowlisted programs trust the workspace.** A program that reads configuration or hooks from its working
+    directory (git, cargo, npm, make) takes instructions from whatever the plan wrote there. The same holds
+    for any variable in `allow_env` that points a tool at its configuration (`HOME`, `XDG_CONFIG_HOME`,
+    `CARGO_HOME`). Allowlist accordingly.
   * **Browser.** The page is re-checked before every action, but between two actions it could load
     anything, and ports are not constrained.
 
