@@ -339,6 +339,37 @@ fn build_action_observation(reports: &[ActionReport]) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// A core module of `sections` (raw section bytes).
+    fn module(sections: &[u8]) -> Vec<u8> {
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+        bytes.extend_from_slice(sections);
+        bytes
+    }
+
+    /// The engine refuses the proposals the memory budget cannot hold: 64-bit memories and tables
+    /// (an overflowing 64-bit table growth is reported to the limiter as a failure it never
+    /// approved), shared memories (never shown to the limiter) and multiple memories.
+    #[test]
+    fn the_engine_refuses_proposals_the_memory_budget_cannot_hold() {
+        let engine = build_engine().expect("engine");
+        let one_memory = module(b"\x05\x03\x01\x00\x01");
+        assert!(
+            wasmtime::Module::new(&engine, &one_memory).is_ok(),
+            "the control loads"
+        );
+        for (what, sections) in [
+            ("a 64-bit memory", &b"\x05\x03\x01\x04\x01"[..]),
+            ("a 64-bit table", &b"\x04\x04\x01\x70\x04\x01"[..]),
+            ("a shared memory", &b"\x05\x04\x01\x03\x01\x01"[..]),
+            ("two memories", &b"\x05\x05\x02\x00\x01\x00\x01"[..]),
+        ] {
+            assert!(
+                wasmtime::Module::new(&engine, module(sections)).is_err(),
+                "{what} is refused"
+            );
+        }
+    }
+
     fn report(capability: &str, success: bool) -> ActionReport {
         ActionReport {
             capability: capability.to_string(),

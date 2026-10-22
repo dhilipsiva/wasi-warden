@@ -300,3 +300,57 @@ fn actions_stop_at_the_wall_clock_budget() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A plan runs at most 32 actions, and the host's log lines hold no more than a bounded slice of
+/// what the planner wrote (its thought here is 100 KB).
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn a_plan_is_capped_in_actions_and_in_the_log() {
+    let actions: Vec<serde_json::Value> = (0..100)
+        .map(|_| serde_json::json!({ "capability": "fs.list_dir", "input": {} }))
+        .collect();
+    let (port, seen) = support::fake_llm(vec![
+        serde_json::json!({
+            "status": "continue",
+            "thought": "x".repeat(100_000),
+            "actions": actions
+        }),
+        serde_json::json!({ "status": "complete", "thought": "done", "actions": [], "reason": "done" }),
+    ]);
+    let (root, config) = setup("plancap", port, "");
+    let out = support::run_step(&config, "Plan a lot");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains(&"x".repeat(2_000)),
+        "the thought is cut in the log ({} bytes of stderr)",
+        stderr.len()
+    );
+    let seen = seen.lock().expect("log");
+    let request: serde_json::Value = serde_json::from_str(&seen[1]).expect("request JSON");
+    let content = request["messages"][1]["content"]
+        .as_str()
+        .unwrap_or_default();
+    let observed: serde_json::Value = serde_json::from_str(
+        content
+            .split_once("Observation data: ")
+            .map(|(_, d)| d)
+            .unwrap_or("{}"),
+    )
+    .expect("observation JSON");
+    let reports = observed["actions"].as_array().expect("actions");
+    assert_eq!(
+        reports.len(),
+        33,
+        "32 actions ran, and one report says the rest did not"
+    );
+    assert!(
+        reports[32]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("at most 32"),
+        "{}",
+        reports[32]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

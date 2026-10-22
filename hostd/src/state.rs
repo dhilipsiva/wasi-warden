@@ -200,17 +200,24 @@ mod tests {
         assert!(limiter.table_growing(0, 1_000, None).unwrap());
     }
 
-    /// A growth past the memory's own maximum fails without being counted, and one that fails after
-    /// it was allowed is taken back.
+    /// A growth past the memory's own maximum fails without being counted. One that fails after it
+    /// was allowed stays counted: wasmtime also reports failures it never asked about (a table
+    /// growth whose size overflows), so taking a growth back would let a guest grow for free.
     #[test]
-    fn failed_growth_is_not_counted() {
+    fn a_failed_growth_stays_counted() {
         let mut limiter = GuestLimiter::new(64 << 20);
         assert!(!limiter.memory_growing(0, 60 * MIB, Some(MIB)).unwrap());
         assert!(limiter.memory_growing(0, 60 * MIB, None).unwrap());
         limiter
+            .table_grow_failed(wasmtime::Error::msg("overflow calculating new table size"))
+            .unwrap();
+        limiter
             .memory_grow_failed(wasmtime::Error::msg("no memory"))
             .unwrap();
-        assert!(limiter.memory_growing(0, 60 * MIB, None).unwrap());
+        assert!(
+            limiter.memory_growing(0, 10 * MIB, None).is_err(),
+            "the 60 MiB is still counted"
+        );
     }
 
     #[test]

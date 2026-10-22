@@ -341,7 +341,8 @@ fn probe_sessions() -> Map<String, Value> {
 /// What the LLM capability answers, as "allowed", "limit" or "refused: <why>".
 fn ask_llm() -> Value {
     let options = Options {
-        max_tokens: None,
+        // Far past the budget: the host cuts it to what is left.
+        max_tokens: Some(1_000_000),
         temperature: None,
         top_p: None,
         stop: Vec::new(),
@@ -445,8 +446,17 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
         "browser" => return probe_browser(&task),
         "browser_budget" => return probe_browser_budget(&task),
         "sleep" => {
+            // A browser session left open, for the watchdog to quit.
+            let session = task["browser"].as_bool().unwrap_or(false).then(|| {
+                browser::open_session(&SessionOptions {
+                    profile: None,
+                    headless: true,
+                    allow_downloads: false,
+                })
+            });
             // Blocks in a WASI clock call, where no epoch can interrupt it.
             std::thread::sleep(Duration::from_millis(task["ms"].as_u64().unwrap_or(0)));
+            drop(session);
             let mut out = Map::new();
             out.insert("slept".into(), json!(true));
             return out;
@@ -461,6 +471,47 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
         "input" => {
             let mut out = Map::new();
             out.insert("key_sequence".into(), outcome(&input::key_sequence("x")));
+            return out;
+        }
+        "refusals" => {
+            let mut out = Map::new();
+            let echo = task["echo"].as_str().unwrap_or_default().to_string();
+            let stdin = proc::spawn(&echo, &spawn_options(&["x"], Vec::new(), None))
+                .and_then(|p| p.write_stdin(b"x", false));
+            out.insert("write_stdin".into(), outcome(&stdin));
+            let options = SessionOptions {
+                profile: None,
+                headless: true,
+                allow_downloads: false,
+            };
+            let eval = browser::open_session(&options).and_then(|s| s.eval("1"));
+            out.insert("eval".into(), outcome(&eval));
+            return out;
+        }
+        "slow" => {
+            // A host call that waits far longer than the run has left.
+            let options = SessionOptions {
+                profile: None,
+                headless: true,
+                allow_downloads: false,
+            };
+            let url = task["url"].as_str().unwrap_or_default().to_string();
+            let mut out = Map::new();
+            let waited = match task["wait"].as_str().unwrap_or_default() {
+                "settle" => budgeted(
+                    &browser::open_session(&options).and_then(|s| s.goto(&url, Some(60_000))),
+                ),
+                "find" => budgeted(&browser::open_session(&options).and_then(|s| {
+                    s.goto(&url, Some(0))?;
+                    let selector = Selector {
+                        kind: SelectorKind::Css,
+                        value: "#missing".into(),
+                    };
+                    s.find(&selector, Some(60_000))
+                })),
+                _ => ask_llm(),
+            };
+            out.insert("waited".into(), waited);
             return out;
         }
         "burn" => {

@@ -449,8 +449,8 @@ fn a_guest_asleep_in_wasi_is_stopped_at_the_wall_clock_budget() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(
-        stderr.contains("inside a host call"),
-        "the watchdog ended it: {stderr}"
+        stderr.contains("by 5 s inside a host call"),
+        "the watchdog ended it, 5 s past the budget: {stderr}"
     );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(40),
@@ -558,7 +558,7 @@ fn browser_sessions_are_capped() {
 fn the_token_budget_holds_inside_a_round_and_between_rounds() {
     let done =
         serde_json::json!({ "status": "complete", "thought": "ok", "actions": [], "reason": "ok" });
-    let (port, _seen) = support::fake_llm_costing(vec![done], 600);
+    let (port, seen) = support::fake_llm_costing(vec![done], 600);
     let (root, ws, config) = probe_setup(
         "spend",
         &format!(
@@ -577,6 +577,11 @@ fn the_token_budget_holds_inside_a_round_and_between_rounds() {
             .expect("results are JSON");
     assert_eq!(results["first"], "allowed", "{results}");
     assert_eq!(results["second"], "limit", "{results}");
+    let first = seen.lock().expect("llm log")[0].clone();
+    assert!(
+        first.contains("\"max_tokens\":10"),
+        "max_tokens was cut to the 10 left: {first}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -603,6 +608,124 @@ fn a_process_gets_no_more_than_the_run_has_left() {
     assert!(
         stderr.contains("interrupted at the wall-clock budget"),
         "the guest was interrupted after the process stopped: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// When the watchdog ends a run, it first quits the run's open browser sessions.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn the_watchdog_quits_the_runs_browser_sessions() {
+    let (port, seen) = support::fake_webdriver();
+    let (root, _ws, config) = probe_setup(
+        "watchdogquit",
+        &format!(
+            "[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = []\n[budgets]\nwallclock_ms = 8000\n"
+        ),
+    );
+    let out = support::run_step_within(
+        &support::probe_component(),
+        &config,
+        r#"{"mode":"sleep","ms":120000,"browser":true}"#,
+        std::time::Duration::from_secs(60),
+    )
+    .expect("hostd ended the run within 60 s");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("inside a host call"), "{stderr}");
+    let requests = seen.lock().expect("webdriver log");
+    assert!(
+        requests
+            .iter()
+            .any(|(m, p, _)| m == "DELETE" && p.starts_with("/session/")),
+        "the session was quit: {requests:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Run the `slow` probe (a wait of `wait` far past the budget) and require that it ended at the
+/// budget, the wait cut short and the guest then interrupted, not by the watchdog.
+fn waits_end_at_the_budget(wait: &str, extra: &str) {
+    let (root, _ws, config) = probe_setup(
+        &format!("slow-{wait}"),
+        &format!("{extra}[budgets]\nwallclock_ms = 8000\n"),
+    );
+    let task =
+        serde_json::json!({ "mode": "slow", "wait": wait, "url": "http://login.example.test/" });
+    let out = support::run_step_within(
+        &support::probe_component(),
+        &config,
+        &task.to_string(),
+        std::time::Duration::from_secs(90),
+    )
+    .expect("hostd ended the run within 90 s");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("interrupted at the wall-clock budget")
+            && !stderr.contains("inside a host call"),
+        "the {wait} wait was cut to the time left: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn browser_config(port: u16) -> String {
+    format!(
+        "[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = [\"login.example.test\"]\n"
+    )
+}
+
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn a_page_settle_wait_ends_at_the_budget() {
+    let (port, _seen) = support::fake_webdriver();
+    waits_end_at_the_budget("settle", &browser_config(port));
+}
+
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn a_find_wait_ends_at_the_budget() {
+    let (port, _seen) = support::fake_webdriver();
+    waits_end_at_the_budget("find", &browser_config(port));
+}
+
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn an_llm_request_ends_at_the_budget() {
+    let port = support::slow_llm(std::time::Duration::from_secs(45));
+    waits_end_at_the_budget(
+        "llm",
+        &format!(
+            "[llm]\napi_base = \"http://127.0.0.1:{port}/v1\"\napi_key = \"test\"\nmodel = \"scripted\"\n"
+        ),
+    );
+}
+
+/// Writing to a process's stdin and evaluating a script in a page are refused.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn stdin_and_script_evaluation_are_refused() {
+    let (port, _seen) = support::fake_webdriver();
+    let echo = which("echo");
+    let (root, ws, config) = probe_setup(
+        "refusals",
+        &format!(
+            "allow_proc = [{echo:?}]\n[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = []\n"
+        ),
+    );
+    let results = probe_results(
+        &config,
+        &ws,
+        serde_json::json!({ "mode": "refusals", "echo": echo }),
+    );
+    let stdin = results["write_stdin"].as_str().unwrap_or_default();
+    assert!(
+        stdin.starts_with("refused") && stdin.contains("stdin is closed"),
+        "{results}"
+    );
+    let eval = results["eval"].as_str().unwrap_or_default();
+    assert!(
+        eval.starts_with("refused") && eval.contains("script evaluation is disabled"),
+        "{results}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

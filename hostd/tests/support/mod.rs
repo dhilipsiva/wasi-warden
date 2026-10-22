@@ -110,6 +110,16 @@ fn serve(handle: impl Fn(&str, &str, &str) -> String + Send + Sync + 'static) ->
     port
 }
 
+/// The fake servers are on loopback; a proxy from the environment would intercept them.
+const PROXY_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+
 /// A chat-completions endpoint answering each request with the next of `plans` (the last repeats);
 /// returns its port and the request bodies it saw.
 pub fn fake_llm(plans: Vec<serde_json::Value>) -> (u16, Arc<Mutex<Vec<String>>>) {
@@ -129,6 +139,20 @@ pub fn fake_llm_costing(
             "total_tokens": tokens
         })),
     )
+}
+
+/// A chat-completions endpoint that takes `delay` to answer each request (with a plan to finish).
+pub fn slow_llm(delay: std::time::Duration) -> u16 {
+    serve(move |_method, _path, _body| {
+        thread::sleep(delay);
+        serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "{\"status\":\"complete\",\"thought\":\"late\",\"actions\":[]}" },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string()
+    })
 }
 
 /// Like [`fake_llm`], with `usage` as each response's usage report (`None`: no report).
@@ -192,7 +216,12 @@ pub fn fake_webdriver() -> (u16, Requests) {
                 serde_json::json!({ "element-6066-11e4-a52e-4f735466cecf": "fake-element-1" })
             }
             ("POST", p) if p == format!("/session/{SESSION}/elements") => {
-                serde_json::json!([{ "element-6066-11e4-a52e-4f735466cecf": "fake-element-1" }])
+                // `#missing` is never on the page.
+                if body.contains("missing") {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([{ "element-6066-11e4-a52e-4f735466cecf": "fake-element-1" }])
+                }
             }
             ("GET", p) if p == format!("/session/{SESSION}/element/fake-element-1/text") => {
                 serde_json::json!("fake text")
@@ -268,6 +297,9 @@ pub fn run_step_within(
         .env("RUST_LOG", "info")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    for var in PROXY_VARS {
+        cmd.env_remove(var);
+    }
     let mut child = cmd.spawn().expect("run hostd");
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         std::thread::spawn(move || {
@@ -302,6 +334,12 @@ pub fn run_step_within(
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            // What hostd wrote before it had to be killed, for the failing test's output.
+            let stderr = stderr.join().unwrap_or_default();
+            eprintln!(
+                "hostd was killed after {limit:?}; its stderr:\n{}",
+                String::from_utf8_lossy(&stderr)
+            );
             return None;
         }
         thread::sleep(std::time::Duration::from_millis(20));
@@ -323,15 +361,7 @@ pub fn run_step_with(component: &Path, config: &Path, task: &str) -> Output {
         .arg(config)
         .args(["--task", task, "--observation", "{}"])
         .env("RUST_LOG", "info");
-    // The fake servers are on loopback; a proxy from the environment would intercept them.
-    for var in [
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ] {
+    for var in PROXY_VARS {
         cmd.env_remove(var);
     }
     cmd.output().expect("run hostd")
