@@ -292,7 +292,7 @@ fn the_policy_capability_reports_and_enforces_the_budgets() {
     );
     let results = probe_results(&config, &ws, serde_json::json!({ "mode": "policy" }));
     assert_eq!(results["budgets"]["processes"], 4, "{results}");
-    assert_eq!(results["budgets"]["filesystemops"], 100, "{results}");
+    assert_eq!(results["budgets"]["filesystem_ops"], 100, "{results}");
     assert_eq!(
         results["commands"],
         serde_json::json!(["echo"]),

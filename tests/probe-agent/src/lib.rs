@@ -92,6 +92,17 @@ fn probe_writes(ws: &DirHandle) -> Map<String, Value> {
     out
 }
 
+fn kind_name(kind: BudgetKind) -> &'static str {
+    match kind {
+        BudgetKind::Steps => "steps",
+        BudgetKind::WallclockMs => "wallclock_ms",
+        BudgetKind::LlmTokens => "llm_tokens",
+        BudgetKind::Processes => "processes",
+        BudgetKind::FilesystemOps => "filesystem_ops",
+        BudgetKind::BrowserActions => "browser_actions",
+    }
+}
+
 /// The policy capability: the snapshot, budget claims, a grant request and an audit event.
 fn probe_policy() -> Map<String, Value> {
     let mut out = Map::new();
@@ -100,7 +111,7 @@ fn probe_policy() -> Map<String, Value> {
             let budgets: Map<String, Value> = snapshot
                 .budgets
                 .iter()
-                .map(|b| (format!("{:?}", b.kind).to_lowercase(), json!(b.limit)))
+                .map(|b| (kind_name(b.kind).to_string(), json!(b.limit)))
                 .collect();
             out.insert("budgets".into(), Value::Object(budgets));
             out.insert(
