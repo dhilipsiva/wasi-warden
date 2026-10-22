@@ -761,3 +761,64 @@ fn cleanup_after_a_completed_run_is_not_overdue() {
     assert_eq!(quits, 4, "each session was quit, once");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The probe's WIT calls are each audited, with their outputs digested rather than recorded.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn the_wit_calls_are_audited() {
+    let root = support::scratch_dir("witaudit");
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).expect("workspace");
+    std::fs::write(ws.join("seed.txt"), "seed-contents-7d1").expect("seed");
+    let audit = root.join("audit.jsonl");
+    let config = root.join("hostd.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "workspace_root = {:?}\n[audit]\npath = {:?}\n",
+            ws.display().to_string(),
+            audit.display().to_string()
+        ),
+    )
+    .expect("config");
+    let out = support::run_step_with(
+        &support::probe_component(),
+        &config,
+        r#"{"mode":"write_ops"}"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&audit).expect("the audit log");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    let calls: Vec<&str> = events
+        .iter()
+        .filter(|e| e["source"] == "wit")
+        .filter_map(|e| e["capability"].as_str())
+        .collect();
+    for expected in [
+        "fs.open-workspace",
+        "fs.ensure-dir",
+        "fs.open-file",
+        "fs.rename",
+        "fs.remove-file",
+    ] {
+        assert!(calls.contains(&expected), "{expected} missing: {calls:?}");
+    }
+    assert!(
+        events
+            .iter()
+            .all(|e| e["output_sha256"].as_str().is_some_and(|d| d.len() == 64)),
+        "every call's output is digested"
+    );
+    assert!(
+        !text.contains("seed-contents-7d1"),
+        "file contents are not recorded"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -361,3 +361,144 @@ fn a_plan_is_capped_in_actions_and_in_the_log() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The capabilities the host runs: every one is shown to the planner.
+const CAPABILITIES: [&str; 11] = [
+    "fs.list_dir",
+    "fs.read_file",
+    "proc.spawn",
+    "browser.open_session",
+    "browser.session.goto",
+    "browser.session.describe_page",
+    "browser.session.find",
+    "browser.element.click",
+    "browser.element.type_text",
+    "browser.element.inner_text",
+    "browser.session.screenshot",
+];
+
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn the_planner_is_shown_every_capability_the_host_runs() {
+    let (port, seen) = support::fake_llm(vec![serde_json::json!({
+        "status": "complete", "thought": "done", "actions": [], "reason": "done"
+    })]);
+    let (root, config) = setup("catalog", port, "");
+    let out = support::run_step(&config, "Look around");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen = seen.lock().expect("log");
+    let request: serde_json::Value = serde_json::from_str(&seen[0]).expect("request JSON");
+    let system = request["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default();
+    for name in CAPABILITIES {
+        assert!(
+            system.contains(name),
+            "{name} is missing from the prompt:\n{system}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A reply that is not a plan is answered with the parse error, once, instead of ending the run.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn a_reply_that_is_not_a_plan_is_asked_again() {
+    let (port, seen) = support::fake_llm(vec![
+        serde_json::json!("I will list the files now."),
+        serde_json::json!({
+            "status": "continue",
+            "thought": "list",
+            "actions": [{ "capability": "fs.list_dir", "input": {} }]
+        }),
+        serde_json::json!({ "status": "complete", "thought": "done", "actions": [], "reason": "done" }),
+    ]);
+    let (root, config) = setup("replan", port, "");
+    let out = support::run_step(&config, "List files");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen = seen.lock().expect("log");
+    assert_eq!(seen.len(), 3, "the bad reply, the retry, then completion");
+    assert!(
+        seen[1].contains("could not be parsed"),
+        "the retry names the problem: {}",
+        seen[1]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every capability call becomes one JSON line in the audit log: the planner's actions, and the
+/// WIT calls the agent makes (here, to the LLM).
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn every_capability_call_is_audited() {
+    let (port, _seen) = support::fake_llm(vec![
+        serde_json::json!({
+            "status": "continue",
+            "thought": "two actions",
+            "actions": [
+                { "capability": "fs.list_dir", "input": {} },
+                { "capability": "proc.spawn", "input": { "command": "echo", "args": ["hi"] } }
+            ]
+        }),
+        serde_json::json!({ "status": "complete", "thought": "done", "actions": [], "reason": "done" }),
+    ]);
+    let root = support::scratch_dir("audit");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let config = root.join("hostd.toml");
+    support::write_config(&config, &workspace, port, None);
+    let audit = root.join("audit.jsonl");
+    support::append_config(
+        &config,
+        &format!("[audit]\npath = {:?}\n", audit.display().to_string()),
+    );
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("allow_proc = []", "allow_proc = [\"echo\"]");
+    std::fs::write(&config, text).unwrap();
+    let out = support::run_step(&config, "Audit me");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&audit)
+        .expect("the audit log")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    let actions: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["source"] == "action").collect();
+    let names: Vec<&str> = actions
+        .iter()
+        .map(|e| e["capability"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["fs.list_dir", "proc.spawn"], "{events:?}");
+    for e in &actions {
+        assert_eq!(e["ok"], true, "{e}");
+        assert_eq!(e["output_sha256"].as_str().map(str::len), Some(64), "{e}");
+        assert!(
+            e["ms"].is_u64() && e["run"].is_string() && e["step"].is_u64(),
+            "{e}"
+        );
+    }
+    let llm_calls = events
+        .iter()
+        .filter(|e| e["source"] == "wit" && e["capability"] == "llm.complete")
+        .count();
+    assert_eq!(llm_calls, 2, "both rounds' LLM calls: {events:?}");
+    let runs: std::collections::BTreeSet<&str> = events
+        .iter()
+        .map(|e| e["run"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(runs.len(), 1, "one run id");
+    let _ = std::fs::remove_dir_all(&root);
+}

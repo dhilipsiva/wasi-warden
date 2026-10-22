@@ -217,6 +217,11 @@ pub fn fake_webdriver_quitting_in(quit_delay: std::time::Duration) -> (u16, Requ
             ("GET", p) if p == format!("/session/{SESSION}/title") => {
                 serde_json::json!("Fake title")
             }
+            ("GET", p) if p == format!("/session/{SESSION}/source") => {
+                serde_json::json!(
+                    "<html><body><p data-test='user-greeting'>Hello</p></body></html>"
+                )
+            }
             ("POST", p) if p == format!("/session/{SESSION}/element") => {
                 serde_json::json!({ "element-6066-11e4-a52e-4f735466cecf": "fake-element-1" })
             }
