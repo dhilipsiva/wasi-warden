@@ -16,12 +16,14 @@ use wasmtime_wasi::p2::add_to_linker_sync;
 use tokio::runtime::Handle;
 
 use crate::actions::{ActionExecutor, ActionReport};
+use crate::audit::Audit;
 use crate::bindings;
 use crate::bindings::exports::osagent::agent::planner::{AgentError, Observation, StepResponse};
 use crate::browser::Sessions;
 use crate::budget::{self, Budgets, Kind, Limits};
 use crate::cli::StepArgs;
 use crate::config::HostConfig;
+use crate::registry;
 use crate::state::{HostState, OverMemory};
 
 /// Run the plan-act loop for `args`. The loop blocks: wasmtime calls the component synchronously,
@@ -175,12 +177,15 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
     let watchdog = Watchdog::start(deadline, limits, sessions.clone(), tokio_handle.clone());
     let _ticker = EpochTicker::start(&engine);
 
+    let audit = Audit::install(config.audit_path.as_deref(), config.secrets.clone())?;
+    let tools = registry::catalog().to_string();
     let observation_json = validate_json(&args.observation)?;
     let mut current_step = args.step;
     let mut observation = Observation {
         step: current_step,
         summary: format!("host bootstrap step {}", current_step),
         data: observation_json,
+        tools: tools.clone(),
     };
 
     let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -194,6 +199,7 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
         tokio_handle.clone(),
         Arc::clone(&budgets),
         sessions.clone(),
+        audit,
     );
 
     let mut store = Store::new(
@@ -225,6 +231,7 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
                 );
             }
             bound_round(&mut store, &budgets, limits)?;
+            audit.set_step(current_step);
             let planner_result = planner
                 .call_step(&mut store, &args.task, &observation)
                 .map_err(|err| guest_stopped(err, limits))
@@ -242,6 +249,7 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
                     let (run, past) = plan
                         .actions
                         .split_at(plan.actions.len().min(MAX_ACTIONS_PER_PLAN));
+                    // Reports come back with every secret value redacted to its reference.
                     let mut reports = executor.execute(run);
                     if !past.is_empty() {
                         reports.push(ActionReport::failed(
@@ -258,6 +266,7 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
                         step: current_step,
                         summary: summarize_reports(&reports),
                         data: build_action_observation(&reports)?,
+                        tools: tools.clone(),
                     };
                 }
                 StepResponse::Complete(done) => {

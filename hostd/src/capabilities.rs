@@ -26,6 +26,7 @@ use crate::resources::{
     ProcessResource,
 };
 use crate::sandbox;
+use crate::secrets::Secrets;
 use crate::state::HostState;
 use bindings::osagent::llm::llm::Role as MessageRole;
 
@@ -200,7 +201,10 @@ fn clamp_max_tokens(requested: Option<u32>, left: u64) -> Option<u32> {
     requested.map(|m| m.min(u32::try_from(left).unwrap_or(u32::MAX)))
 }
 
-fn messages_to_chat(messages: Vec<bindings::osagent::llm::llm::Message>) -> Vec<ChatMessage> {
+fn messages_to_chat(
+    messages: Vec<bindings::osagent::llm::llm::Message>,
+    secrets: &Secrets,
+) -> Vec<ChatMessage> {
     messages
         .into_iter()
         .map(|msg| ChatMessage {
@@ -210,7 +214,7 @@ fn messages_to_chat(messages: Vec<bindings::osagent::llm::llm::Message>) -> Vec<
                 MessageRole::Assistant => "assistant".to_string(),
                 MessageRole::Tool => "tool".to_string(),
             },
-            content: msg.content,
+            content: secrets.redact(&msg.content),
             name: msg.name.filter(|n| !n.trim().is_empty()),
         })
         .collect()
@@ -218,6 +222,7 @@ fn messages_to_chat(messages: Vec<bindings::osagent::llm::llm::Message>) -> Vec<
 
 fn tools_to_chat(
     tools: Vec<bindings::osagent::llm::llm::ToolSchema>,
+    secrets: &Secrets,
 ) -> Result<Vec<ChatTool>, CapabilityError> {
     let mut result = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -230,20 +235,23 @@ fn tools_to_chat(
         result.push(ChatTool {
             kind: "function",
             function: ChatToolFunction {
-                name: tool.name,
-                description: Some(tool.description),
-                parameters,
+                name: secrets.redact(&tool.name),
+                description: Some(secrets.redact(&tool.description)),
+                parameters: secrets.redact_value(&parameters),
             },
         });
     }
     Ok(result)
 }
 
+/// The request for the model. Every message is redacted here, the one place everything bound for the
+/// model passes: no secret value reaches it, whatever the guest puts in a message.
 fn build_chat_request(
     model: &str,
     messages: Vec<bindings::osagent::llm::llm::Message>,
     options: bindings::osagent::llm::llm::Options,
     tools: Option<Vec<ChatTool>>,
+    secrets: &Secrets,
 ) -> ChatRequest {
     let stop = if options.stop.is_empty() {
         None
@@ -252,7 +260,7 @@ fn build_chat_request(
     };
     ChatRequest {
         model: model.to_string(),
-        messages: messages_to_chat(messages),
+        messages: messages_to_chat(messages, secrets),
         tool_choice: tools.as_ref().map(|_| "auto".to_string()),
         tools,
         max_tokens: options.max_tokens,
@@ -952,7 +960,13 @@ impl bindings::osagent::proc::proc::Host for HostState {
         // The host's PATH, outside the workspace; the guest cannot set it.
         cmd.env("PATH", &self.config.child_path);
         for env in options.env {
-            cmd.env(env.key, env.value);
+            // A secret reference becomes its value here, for the process only.
+            let value = self
+                .config
+                .secrets
+                .resolve(&env.value)
+                .map_err(|why| denied(why.to_string()))?;
+            cmd.env(env.key, value);
         }
 
         // Runs to completion here (bounded in time and output); the handle then serves its results.
@@ -961,10 +975,11 @@ impl bindings::osagent::proc::proc::Host for HostState {
         let timeout = sandbox::proc_timeout(options.timeout_ms).min(remaining);
         let output =
             sandbox::run_bounded(cmd, timeout).map_err(|err| io_error("proc.spawn", err))?;
+        let secrets = &self.config.secrets;
         let resource = ProcessResource {
             command: command.clone(),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout: secrets.redact_bytes(&output.stdout),
+            stderr: secrets.redact_bytes(&output.stderr),
             stdout_pos: 0,
             stderr_pos: 0,
             exit_code: output.status,
@@ -1168,10 +1183,11 @@ impl bindings::osagent::browser::browser::HostSession for HostState {
             .browser()?
             .describe(&driver, include_html)
             .map_err(browser_error)?;
+        let secrets = &self.config.secrets;
         Ok(bindings::osagent::browser::browser::PageState {
-            url: page.url,
-            title: page.title,
-            html: page.html,
+            url: secrets.redact(&page.url),
+            title: page.title.map(|t| secrets.redact(&t)),
+            html: page.html.map(|h| secrets.redact(&h)),
         })
     }
 
@@ -1251,6 +1267,12 @@ impl bindings::osagent::browser::browser::HostElementHandle for HostState {
     ) -> Result<(), CapabilityError> {
         self.charge(Kind::BrowserActions)?;
         let (driver, element) = self.element_parts(&element)?;
+        // A secret reference becomes its value here, on its way into the page, and nowhere else.
+        let text = self
+            .config
+            .secrets
+            .resolve(&text)
+            .map_err(|why| denied(why.to_string()))?;
         self.browser()?
             .type_text(&driver, &element, &text, submit)
             .map_err(browser_error)
@@ -1271,25 +1293,31 @@ impl bindings::osagent::browser::browser::HostElementHandle for HostState {
     ) -> Result<Option<String>, CapabilityError> {
         self.charge(Kind::BrowserActions)?;
         let (driver, element) = self.element_parts(&element)?;
-        self.browser()?
+        let value = self
+            .browser()?
             .attribute(&driver, &element, &name)
-            .map_err(browser_error)
+            .map_err(browser_error)?;
+        Ok(value.map(|v| self.config.secrets.redact(&v)))
     }
 
     fn inner_text(&mut self, element: Resource<ElementHandle>) -> Result<String, CapabilityError> {
         self.charge(Kind::BrowserActions)?;
         let (driver, element) = self.element_parts(&element)?;
-        self.browser()?
+        let text = self
+            .browser()?
             .inner_text(&driver, &element)
-            .map_err(browser_error)
+            .map_err(browser_error)?;
+        Ok(self.config.secrets.redact(&text))
     }
 
     fn html(&mut self, element: Resource<ElementHandle>) -> Result<String, CapabilityError> {
         self.charge(Kind::BrowserActions)?;
         let (driver, element) = self.element_parts(&element)?;
-        self.browser()?
+        let html = self
+            .browser()?
             .outer_html(&driver, &element)
-            .map_err(browser_error)
+            .map_err(browser_error)?;
+        Ok(self.config.secrets.redact(&html))
     }
 
     fn drop(&mut self, element: Resource<ElementHandle>) -> wasmtime::Result<()> {
@@ -1359,7 +1387,13 @@ impl bindings::osagent::llm::llm::Host for HostState {
         let settings = require_llm_settings(&self.config)?;
         let mut options = options;
         options.max_tokens = clamp_max_tokens(options.max_tokens, self.tokens_remaining());
-        let request = build_chat_request(&settings.model, messages, options, None);
+        let request = build_chat_request(
+            &settings.model,
+            messages,
+            options,
+            None,
+            &self.config.secrets,
+        );
         let response = execute_chat_request(settings, &request, timeout)?;
         let reply_bytes = response
             .choices
@@ -1401,10 +1435,16 @@ impl bindings::osagent::llm::llm::Host for HostState {
         self.tokens_left()?;
         let timeout = self.time_left()?.min(LLM_TIMEOUT);
         let settings = require_llm_settings(&self.config)?;
-        let chat_tools = tools_to_chat(tools)?;
+        let chat_tools = tools_to_chat(tools, &self.config.secrets)?;
         let mut options = options;
         options.max_tokens = clamp_max_tokens(options.max_tokens, self.tokens_remaining());
-        let request = build_chat_request(&settings.model, messages, options, Some(chat_tools));
+        let request = build_chat_request(
+            &settings.model,
+            messages,
+            options,
+            Some(chat_tools),
+            &self.config.secrets,
+        );
         let response = execute_chat_request(settings, &request, timeout)?;
         let reply_bytes = response.choices.first().map_or(0, |c| {
             serde_json::to_vec(&c.message.tool_calls).map_or(0, |v| v.len())
@@ -1579,7 +1619,7 @@ mod tests {
             content: content.to_string(),
             name: None,
         };
-        build_chat_request("m", vec![message], options, None)
+        build_chat_request("m", vec![message], options, None, &Secrets::default())
     }
 
     fn usage(prompt: Option<u32>, completion: Option<u32>, total: Option<u32>) -> ChatUsage {

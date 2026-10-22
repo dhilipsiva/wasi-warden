@@ -1,9 +1,13 @@
 mod actions;
+mod audit;
 mod resources;
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../wit",
         world: "control",
+        // A tracing span per WIT call, which the audit layer turns into audit lines. Without
+        // `verbose_tracing`, arguments and results holding lists (file bytes, messages) are elided.
+        imports: { default: tracing },
         with: {
             "osagent:fs/fs.dir-handle": crate::resources::DirHandleResource,
             "osagent:fs/fs.file-handle": crate::resources::FileHandleResource,
@@ -19,8 +23,10 @@ mod capabilities;
 mod cli;
 mod config;
 mod logging;
+mod registry;
 mod runtime;
 mod sandbox;
+mod secrets;
 mod state;
 
 use anyhow::Result;

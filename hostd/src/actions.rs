@@ -12,10 +12,12 @@ use serde_json::{Value, json};
 use thirtyfour::prelude::*;
 use tokio::runtime::Handle;
 
+use crate::audit::Audit;
 use crate::bindings::exports::osagent::agent::planner::PlannedAction;
 use crate::browser::{Browser, Select, Sessions};
 use crate::budget::{self, Kind};
 use crate::config::HostConfig;
+use crate::registry::Action;
 use crate::sandbox;
 
 #[derive(Debug, Serialize)]
@@ -53,6 +55,7 @@ pub struct ActionExecutor {
     tokio: Handle,
     budgets: budget::Shared,
     sessions: Sessions,
+    audit: &'static Audit,
     browser_sessions: HashMap<String, WebDriver>,
     browser_elements: HashMap<String, BrowserElementEntry>,
 }
@@ -68,12 +71,14 @@ impl ActionExecutor {
         tokio: Handle,
         budgets: budget::Shared,
         sessions: Sessions,
+        audit: &'static Audit,
     ) -> Self {
         Self {
             config,
             tokio,
             budgets,
             sessions,
+            audit,
             browser_sessions: HashMap::new(),
             browser_elements: HashMap::new(),
         }
@@ -86,13 +91,31 @@ impl ActionExecutor {
             .collect()
     }
 
+    /// Run one action, audit it, and report it with every secret value redacted to its reference
+    /// (the report is what the planner sees next).
     fn execute_action(&mut self, action: &PlannedAction) -> ActionReport {
         let capability = action.capability.clone();
+        let started = std::time::Instant::now();
         let result = self.execute_action_inner(action);
-        match result {
-            Ok(value) => ActionReport::succeeded(capability, value),
-            Err(err) => ActionReport::failed(capability, err),
-        }
+        let secrets = &self.config.secrets;
+        let report = match result {
+            Ok(value) => ActionReport::succeeded(capability, secrets.redact_value(&value)),
+            Err(err) => {
+                let mut report = ActionReport::failed(capability, err);
+                report.error = report.error.map(|e| secrets.redact(&e));
+                report
+            }
+        };
+        let input = serde_json::from_str(&action.input).unwrap_or(Value::Null);
+        self.audit.record(
+            "action",
+            &report.capability,
+            &input,
+            &report.output.to_string(),
+            report.error.as_deref(),
+            started.elapsed().as_millis() as u64,
+        );
+        report
     }
 
     fn execute_action_inner(&mut self, action: &PlannedAction) -> Result<Value> {
@@ -106,61 +129,61 @@ impl ActionExecutor {
             .map_err(|_| anyhow!("the budgets are unavailable"))?
             .check(Kind::WallclockMs)
             .map_err(anyhow::Error::msg)?;
-        let family = match action.capability.split('.').next() {
-            Some("fs") => Some(Kind::FilesystemOps),
-            Some("proc") => Some(Kind::Processes),
-            Some("browser") => Some(Kind::BrowserActions),
-            _ => None,
+        let Some(kind) = Action::parse(&action.capability) else {
+            let known: Vec<&str> = Action::ALL.iter().map(|a| a.name()).collect();
+            bail!(
+                "unsupported capability `{}` (the host runs: {})",
+                action.capability,
+                known.join(", ")
+            );
         };
-        if let Some(kind) = family {
-            budget::claim(&self.budgets, kind, 1).map_err(anyhow::Error::msg)?;
-        }
-        match action.capability.as_str() {
-            "fs.list_dir" => {
+        budget::claim(&self.budgets, kind.budget(), 1).map_err(anyhow::Error::msg)?;
+        // Exhaustive over the registry, so the catalog the planner is shown is what runs here.
+        match kind {
+            Action::FsListDir => {
                 let params: FsListDirInput = serde_json::from_value(input)?;
                 self.fs_list_dir(params)
             }
-            "fs.read_file" => {
+            Action::FsReadFile => {
                 let params: FsReadFileInput = serde_json::from_value(input)?;
                 self.fs_read_file(params)
             }
-            "proc.spawn" => {
+            Action::ProcSpawn => {
                 let params: ProcSpawnInput = serde_json::from_value(input)?;
                 self.proc_spawn(params)
             }
-            "browser.open_session" => {
+            Action::BrowserOpenSession => {
                 let params: BrowserOpenSessionInput = serde_json::from_value(input)?;
                 self.browser_open_session(params)
             }
-            "browser.session.goto" => {
+            Action::BrowserGoto => {
                 let params: BrowserGotoInput = serde_json::from_value(input)?;
                 self.browser_session_goto(params)
             }
-            "browser.session.describe_page" => {
+            Action::BrowserDescribePage => {
                 let params: BrowserDescribeInput = serde_json::from_value(input)?;
                 self.browser_session_describe(params)
             }
-            "browser.session.find" => {
+            Action::BrowserFind => {
                 let params: BrowserFindInput = serde_json::from_value(input)?;
                 self.browser_session_find(params)
             }
-            "browser.element.click" => {
+            Action::BrowserClick => {
                 let params: BrowserElementActionInput = serde_json::from_value(input)?;
                 self.browser_element_click(params)
             }
-            "browser.element.type_text" => {
+            Action::BrowserTypeText => {
                 let params: BrowserElementTypeInput = serde_json::from_value(input)?;
                 self.browser_element_type(params)
             }
-            "browser.element.inner_text" => {
+            Action::BrowserInnerText => {
                 let params: BrowserElementActionInput = serde_json::from_value(input)?;
                 self.browser_element_inner_text(params)
             }
-            "browser.session.screenshot" => {
+            Action::BrowserScreenshot => {
                 let params: BrowserScreenshotInput = serde_json::from_value(input)?;
                 self.browser_session_screenshot(params)
             }
-            _ => Err(anyhow!("unsupported capability `{}`", action.capability)),
         }
     }
 
@@ -258,7 +281,8 @@ impl ActionExecutor {
         cmd.env("PATH", &self.config.child_path);
         if let Some(env) = params.env {
             for var in env {
-                cmd.env(var.key, var.value);
+                // A secret reference becomes its value here, for the process only.
+                cmd.env(var.key, self.config.secrets.resolve(&var.value)?);
             }
         }
 
@@ -374,7 +398,11 @@ impl ActionExecutor {
     fn browser_element_type(&self, params: BrowserElementTypeInput) -> Result<Value> {
         let element_alias = normalized_alias(&params.element)?;
         let (driver, element) = self.element(&element_alias)?;
-        let text = params.text.unwrap_or_default();
+        // A secret reference becomes its value here, on its way into the page, and nowhere else.
+        let text = self
+            .config
+            .secrets
+            .resolve(&params.text.unwrap_or_default())?;
         self.browser()?
             .type_text(&driver, &element, &text, params.submit.unwrap_or(false))?;
         Ok(json!({ "element": element_alias }))
@@ -591,6 +619,8 @@ mod tests {
             browser: None,
             budgets: budget::Limits::default(),
             workspace_rules: crate::config::WorkspaceRules::default(),
+            secrets: crate::secrets::Secrets::default(),
+            audit_path: None,
         }
     }
 
@@ -599,11 +629,13 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = config(root, allow_proc);
         let budgets = budget::Budgets::shared(config.budgets);
+        let audit = Audit::install(None, crate::secrets::Secrets::default()).expect("audit");
         let mut executor = ActionExecutor::new(
             config,
             runtime.handle().clone(),
             budgets,
             Sessions::default(),
+            audit,
         );
         let action = PlannedAction {
             capability: capability.to_string(),

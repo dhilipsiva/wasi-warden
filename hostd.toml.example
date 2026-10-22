@@ -35,6 +35,18 @@ model = "phi3.5"
 # read_only = false
 # max_file_bytes = 16777216
 
+# Host-side secrets. A plan names one as {{secret:NAME}}; the host fills it in only in text typed into a
+# page and in a spawned process's environment values, and redacts every value from what reaches the model,
+# the observations, the audit log and the log lines.
+# [secrets]
+# demo_username = "demo-user"
+# demo_password = { env = "DEMO_PASSWORD" }
+
+# One JSON line per capability call (the planner's actions and the agent's WIT calls), with outputs
+# digested, not recorded.
+# [audit]
+# path = "hostd-audit.jsonl"
+
 # Browser tasks need a running WebDriver (Chromedriver, Geckodriver, ...).
 # [browser]
 # webdriver_url = "http://127.0.0.1:9515"

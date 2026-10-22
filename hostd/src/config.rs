@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::budget;
 use crate::cli::StepArgs;
 use crate::sandbox::{self, AllowedProgram};
+use crate::secrets::Secrets;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -28,6 +29,10 @@ pub struct HostConfig {
     pub budgets: budget::Limits,
     /// The rules for the workspace (`[workspace]`).
     pub workspace_rules: WorkspaceRules,
+    /// Host-side secrets (`[secrets]`), named in plans as `{{secret:NAME}}`.
+    pub secrets: Secrets,
+    /// Where the audit log is appended (`[audit] path`), if anywhere.
+    pub audit_path: Option<Utf8PathBuf>,
 }
 
 /// `[workspace]`: what the plan may do to the workspace.
@@ -112,6 +117,12 @@ impl HostConfig {
             browser,
             budgets: file_cfg.budgets.unwrap_or_default().into_limits(),
             workspace_rules: file_cfg.workspace.unwrap_or_default().into_rules(),
+            secrets: load_secrets(file_cfg.secrets.unwrap_or_default())?,
+            audit_path: file_cfg
+                .audit
+                .and_then(|a| a.path)
+                .map(|p| normalize_path(Path::new(&p)))
+                .transpose()?,
         })
     }
 
@@ -133,6 +144,37 @@ struct FileConfig {
     browser: Option<BrowserFileSettings>,
     budgets: Option<BudgetFileSettings>,
     workspace: Option<WorkspaceFileSettings>,
+    secrets: Option<std::collections::BTreeMap<String, SecretSource>>,
+    audit: Option<AuditFileSettings>,
+}
+
+/// One `[secrets]` entry: the value itself, or the environment variable holding it.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SecretSource {
+    Value(String),
+    Env { env: String },
+}
+
+fn load_secrets(entries: std::collections::BTreeMap<String, SecretSource>) -> Result<Secrets> {
+    let mut values = Vec::new();
+    for (name, source) in entries {
+        let value = match source {
+            SecretSource::Value(value) => value,
+            SecretSource::Env { env } => std::env::var(&env).with_context(|| {
+                format!("secret `{name}`: environment variable {env} is not set")
+            })?,
+        };
+        values.push((name, value));
+    }
+    Ok(Secrets::new(values))
+}
+
+/// `[audit]`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditFileSettings {
+    path: Option<String>,
 }
 
 /// `[budgets]`; each limit falls back to [`budget::Limits::default`].

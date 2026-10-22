@@ -16,6 +16,7 @@ use bindings::exports::osagent::agent::planner::{
 use bindings::osagent::common::types::{CapabilityError, CapabilityErrorCode};
 use bindings::osagent::llm::llm::{self, Message, Role};
 
+/// The fixed part of the system prompt; the capabilities follow it ([`system_prompt`]).
 const SYSTEM_PROMPT: &str = r#"
 You are an expert automation planner operating inside a secure agent runtime.
 Respond ONLY with JSON matching this schema:
@@ -23,20 +24,34 @@ Respond ONLY with JSON matching this schema:
   "status": "continue" | "complete",
   "thought": "human-readable reasoning",
   "actions": [
-     { "capability": "fs.list_dir" | "proc.spawn" | "fs.read_file",
-       "input": { ... json arguments ... }
+     { "capability": "<one of the capabilities below>",
+       "input": { ... json arguments matching its input schema ... }
      }
   ],
   "result": { ... final result json when status == "complete" },
   "reason": "short explanation when status == \"complete\""
 }
 When status is \"continue\" you MUST include at least one action describing the next capability call.
-Capabilities available:
-- fs.list_dir { "path": "<relative path>" }
-- fs.read_file { "path": "<relative path>", "max_bytes": 4096 }
-- proc.spawn { "command": "<program>", "args": ["..."] }
-Always keep paths relative to the provided workspace.
+Always keep paths relative to the provided workspace. Name secrets as {{secret:NAME}}; the host fills
+them in where they are needed and you never see their values.
 "#;
+
+/// The system prompt: [`SYSTEM_PROMPT`], then every capability the host runs, from the catalog it
+/// sends (`tools`: a JSON array of {name, description, input}).
+fn system_prompt(tools: &str) -> String {
+    let mut prompt = SYSTEM_PROMPT.to_string();
+    prompt.push_str("Capabilities available (name: description; input schema):\n");
+    let catalog: Vec<Value> = serde_json::from_str(tools).unwrap_or_default();
+    for tool in &catalog {
+        prompt.push_str(&format!(
+            "- {}: {} {}\n",
+            tool["name"].as_str().unwrap_or("?"),
+            tool["description"].as_str().unwrap_or(""),
+            tool["input"]
+        ));
+    }
+    prompt
+}
 
 struct Agent;
 
@@ -62,7 +77,33 @@ fn plan_with_llm(
         frequency_penalty: None,
     };
     let completion = llm::complete(&messages, &options).map_err(cap_err("llm.complete"))?;
-    plan_from_content(&completion.content)
+    match plan_from_content(&completion.content) {
+        Ok(plan) => Ok(plan),
+        // Once, show the model its reply and what was wrong with it, and ask again.
+        Err(err) => {
+            let mut retry = messages;
+            retry.push(Message {
+                role: Role::Assistant,
+                content: completion.content,
+                name: None,
+            });
+            retry.push(Message {
+                role: Role::User,
+                content: correction(&err.message),
+                name: None,
+            });
+            let again = llm::complete(&retry, &options).map_err(cap_err("llm.complete"))?;
+            plan_from_content(&again.content)
+        }
+    }
+}
+
+/// What the model is told when its reply is not a plan.
+fn correction(problem: &str) -> String {
+    format!(
+        "Your previous reply could not be parsed as the JSON plan ({problem}). Reply with only the \
+         JSON object the system message describes."
+    )
 }
 
 /// The JSON inside a Markdown code fence (```` ```json ```` or a bare ```` ``` ````), or the reply
@@ -126,7 +167,7 @@ fn build_messages(task: &str, observation: &planner::Observation) -> Vec<Message
     vec![
         Message {
             role: Role::System,
-            content: SYSTEM_PROMPT.to_string(),
+            content: system_prompt(&observation.tools),
             name: None,
         },
         Message {

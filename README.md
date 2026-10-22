@@ -1,7 +1,7 @@
 # wasi-warden
 
-> **Status: design spike, Nov 2025.** Budgets, guest limits and the host's rules are enforced; there
-> is no audit log yet, and known limits are open; do not run it on a machine or data you care about.
+> **Status: design spike, Nov 2025.** Budgets, guest limits, the host's rules, host-side secrets and an
+> audit log are in place, and known limits are open; do not run it on a machine or data you care about.
 > What works and what does not is listed under [Status](#status).
 
 Secure, local-first OS automation for LLMs: the design.
@@ -16,11 +16,11 @@ Think: **computer-use / RPA / ops runbooks**, but:
 * policy-driven
 * LLM-agnostic
 
-For instance, a browser login task (the planner's prompt does not list the browser actions yet, so a real model has to guess their names; see [Status](#status)):
+For instance, a browser login task, whose credentials are host-side secrets the model never sees:
 
 ```
 cargo run -p hostd -- step \
-  --task "Log into https://demo.example/login with creds in secrets/demo-login.json and confirm the dashboard greets the user."
+  --task "Log into https://demo.example/login with the demo_username and demo_password secrets and confirm the dashboard greets the user."
 ```
 
 The sample task is described in [docs/browser-login-task.md](docs/browser-login-task.md).
@@ -69,7 +69,7 @@ If you are fine with a hosted black box, you do not need this project.
    * Any LLM that can speak JSON / tool-calls can drive `wasi-warden`.
    * Local models and cloud APIs both work via a single `llm` capability.
 
-5. **Audit, budgets, verification** (budgets enforced; audit and verification planned; see [Status](#status))
+5. **Audit, budgets, verification** (budgets and the audit log in place; verification planned; see [Status](#status))
 
    * Every action is logged.
    * Per-task limits on steps, time, and scope.
@@ -118,18 +118,16 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
 
 * WIT interfaces for `fs`, `proc`, `browser`, `input`, `llm`, `policy` and the `agent` planner (`wit/`).
 * A Rust host (`hostd`) on the Wasmtime component model that loads the agent component.
-* A Rust guest (`agent-core`) built as a WASI Preview 2 component. It formats the prompt, calls the `llm`
-  capability and parses the returned JSON plan; it calls no other capability itself.
+* A Rust guest (`agent-core`) built as a WASI Preview 2 component. It formats the prompt, listing the
+  capabilities the host sends it (`hostd/src/registry.rs`, the same list the host dispatches on), calls the
+  `llm` capability and parses the returned JSON plan. A reply that is not a plan is answered once with what
+  was wrong; it calls no other capability itself.
 * A bounded loop: `hostd step` asks the planner for a plan, executes its actions natively (`hostd/src/actions.rs`)
   and feeds the results back, within the run's budgets (`[budgets]`, below).
 
-What does not work yet (the tests: 67 hostd and 7 agent-core unit tests, and 33 end-to-end tests that run
+What does not work yet (the tests: 72 hostd and 7 agent-core unit tests, and 41 end-to-end tests that run
 the agent, a probe guest of the WIT capabilities and the browser against scripted fakes, in CI):
 
-* **No audit log yet**: capability calls are traced, but there is no structured log of every call with its
-  inputs and results.
-* **The planner's prompt lists only `fs.list_dir`, `fs.read_file` and `proc.spawn`**, though the host runs eleven
-  actions, browser ones included; a model has to guess the rest.
 * **No input backend**: every `input` call is refused, and so is the browser's script evaluation.
 * **The sandbox isolates only prompt-building code**: the planning happens in the LLM and the actions run in the
   native host, outside the sandbox.
@@ -153,6 +151,12 @@ the agent, a probe guest of the WIT capabilities and the browser against scripte
     opened is not) and its processes die with it, but a file the run was writing may be left
     half-written.
   * **Compiling the component** comes before the run's clock starts; it is capped at 120 s instead.
+  * **Secrets.** A secret goes wherever the plan types it on an allowed host, and into any `allow_env`
+    variable of any allowlisted program; no secret is bound to one host or program. Redaction replaces the
+    exact value only: a page or program that echoes it transformed (encoded, split, reversed) gets past it.
+  * **The audit log** records a WIT call's string arguments (cut to 512 characters; a written file's
+    `contents` only by size) but not its list arguments, such as bytes and messages, which the tracing
+    elides; outputs are recorded only as SHA-256 digests.
 
 Expect breaking changes. The progress snapshot is in [docs/status.md](docs/status.md).
 
@@ -301,10 +305,18 @@ The design's rules:
   not a rule silently dropped. The log lines go to stderr.
 * **The WIT browser interface** follows the same rules as the planner's browser actions; script evaluation is
   refused, because a script could reach any host.
+* **Secrets** (`[secrets]`, each a value or `{ env = "NAME" }`). A plan names one as `{{secret:NAME}}`; the
+  host replaces the reference with the value only in text typed into a page element and in a process's
+  environment values (an unknown name is refused). Every secret value is redacted back to its reference
+  from everything bound for the model (in the one function that builds each LLM request), from the reports
+  the planner reads, from process output and page text returned to the guest, and from the audit log; the
+  WIT call traces never reach the log lines.
+* **Audit log** (`[audit] path`): one JSON line per capability call, the planner's actions and the agent's
+  WIT calls alike, with the run, step, capability, redacted input, outcome, duration and a SHA-256 digest of
+  the output in place of the output.
 
-**Not enforced yet:** an audit log of every capability call. The limits listed under [Status](#status)
-apply. Whatever the planner reads, a
-secrets file included, is sent to the configured LLM provider, so with a cloud model it leaves the machine.
+The limits listed under [Status](#status) apply. Whatever the planner reads, apart from the configured
+secrets' values, is sent to the configured LLM provider, so with a cloud model it leaves the machine.
 
 ---
 

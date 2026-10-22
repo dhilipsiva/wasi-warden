@@ -1,29 +1,43 @@
 ## Browser Login Sample Task
 
-This walkthrough shows how to use the existing WIT contracts to automate a “sign in and verify” flow. The goal: open a site, trigger its login UI, submit credentials, and confirm that the session switched to an authenticated state — all while staying inside `wasi-warden`’s capability boundaries.
+This walkthrough shows a "sign in and verify" flow: open a site, trigger its login UI, submit credentials,
+and confirm that the session switched to an authenticated state, all inside `wasi-warden`'s capability
+boundaries. The credentials never reach the model: the plan names them, and the host fills them in.
+
+`hostd/tests/browser_e2e.rs` (`the_login_walkthrough_runs`) runs the plan below, exactly as written here,
+against a fake WebDriver, so this page stays true.
 
 ---
 
-### 1. Policy + config expectations
+### 1. Configuration
 
-- Browser capability must be enabled in `hostd.toml`. The minimal block looks like:
+- The browser capability must be enabled, and the site's host allowed:
 
   ```toml
   [browser]
-  webdriver_url = "http://127.0.0.1:9515" # chromedriver/geckodriver/etc.
-  default_profile = "default"
+  webdriver_url = "http://127.0.0.1:9515" # chromedriver, geckodriver, ...
   allowed_hosts = ["demo.example"]        # the only hosts the session may visit
   ```
 
-- Workspace should contain the credential material the planner is allowed to read, e.g. `secrets/demo-login.json`.
-- Optional: allow `fs` read-only access to `secrets/`, block write/delete to prevent credential exfiltration.
+- The credentials are host-side secrets, never files in the workspace:
+
+  ```toml
+  [secrets]
+  demo_username = "demo-user"
+  demo_password = { env = "DEMO_PASSWORD" } # or read from the host's environment
+  ```
+
+  A plan names a secret as `{{secret:NAME}}`. The host replaces the reference with the value only in text
+  typed into a page element (`browser.element.type_text`) and in a spawned process's environment values, and
+  redacts every secret value back to its reference from everything bound for the model, the observations,
+  the audit log and the log lines.
 - Input automation stays disabled; all typing happens through browser element handles.
 
 Sample invocation:
 
 ```bash
 cargo run -p hostd -- step \
-  --task "Log into https://demo.example/login with creds in secrets/demo-login.json and confirm the dashboard greets the user." \
+  --task "Log into https://demo.example/login with the demo_username and demo_password secrets and confirm the dashboard greets the user." \
   --observation '{}'
 ```
 
@@ -33,49 +47,34 @@ cargo run -p hostd -- step \
 
 | Capability | Purpose |
 |------------|---------|
-| `fs.read_file` | Load username/password JSON from workspace secrets. |
-| `browser.open-session` | Spawn a headless Chromium/WebDriver session. |
-| `browser.session.goto` | Navigate to the login page. |
-| `browser.session.find` | Locate buttons/inputs using CSS or XPath. |
-| `browser.element.click` | Open modal or submit buttons. |
-| `browser.element.type-text` | Fill username/password; set `submit = false` except for the final Enter. |
-| `browser.session.describe-page` | Snapshot the DOM to verify logged-in state. |
-| `browser.session.screenshot` (optional) | Capture proof of success for auditors. |
-
-Future policy hooks (`policy.request_capability`, `policy.log_event`) can wrap each sensitive step for human-on-the-loop approval.
+| `browser.open_session` | Open a headless Chromium session through the WebDriver. |
+| `browser.session.goto` | Navigate to the login page (an allowed host). |
+| `browser.session.find` | Locate buttons and inputs by CSS, XPath or text. |
+| `browser.element.click` | Open the sign-in form. |
+| `browser.element.type_text` | Fill the username and password from secrets; `submit = true` presses Enter. |
+| `browser.session.describe_page` | Snapshot the page to verify the signed-in state. |
+| `browser.element.inner_text` | Read the greeting. |
+| `browser.session.screenshot` | Capture proof of success. |
 
 ---
 
-### 3. Planner action plan (example)
+### 3. Planner action plan
 
-The planner returns structured JSON actions. Below is a realistic sequence assuming the site requires clicking a “Sign in” button before the form appears. Replace selectors to match the target site.
+The planner returns structured JSON actions. Below is a realistic sequence for a site that needs a "Sign in"
+click before the form appears; replace the selectors to match the target site.
 
 ```json
 {
-  "thought": "Load credentials, open the login form, submit, then confirm dashboard greeting.",
+  "status": "continue",
+  "thought": "Open the login form, sign in with the host's secrets, then confirm the dashboard greeting.",
   "actions": [
     {
-      "capability": "fs.read_file",
-      "input": {
-        "path": "secrets/demo-login.json",
-        "max_bytes": 2048
-      }
-    },
-    {
       "capability": "browser.open_session",
-      "input": {
-        "profile": "default",
-        "headless": true,
-        "allow_downloads": false
-      }
+      "input": { "alias": "session-1", "headless": true, "allow_downloads": false }
     },
     {
       "capability": "browser.session.goto",
-      "input": {
-        "session": "session-1",
-        "url": "https://demo.example/login",
-        "timeout_ms": 15000
-      }
+      "input": { "session": "session-1", "url": "https://demo.example/login", "timeout_ms": 0 }
     },
     {
       "capability": "browser.session.find",
@@ -88,7 +87,7 @@ The planner returns structured JSON actions. Below is a realistic sequence assum
     },
     {
       "capability": "browser.element.click",
-      "input": { "session": "session-1", "element": "signin-btn" }
+      "input": { "element": "signin-btn" }
     },
     {
       "capability": "browser.session.find",
@@ -101,12 +100,7 @@ The planner returns structured JSON actions. Below is a realistic sequence assum
     },
     {
       "capability": "browser.element.type_text",
-      "input": {
-        "session": "session-1",
-        "element": "username-field",
-        "text": "{{creds.username}}",
-        "submit": false
-      }
+      "input": { "element": "username-field", "text": "{{secret:demo_username}}", "submit": false }
     },
     {
       "capability": "browser.session.find",
@@ -119,19 +113,11 @@ The planner returns structured JSON actions. Below is a realistic sequence assum
     },
     {
       "capability": "browser.element.type_text",
-      "input": {
-        "session": "session-1",
-        "element": "password-field",
-        "text": "{{creds.password}}",
-        "submit": true
-      }
+      "input": { "element": "password-field", "text": "{{secret:demo_password}}", "submit": true }
     },
     {
       "capability": "browser.session.describe_page",
-      "input": {
-        "session": "session-1",
-        "include_html": true
-      }
+      "input": { "session": "session-1", "include_html": true }
     },
     {
       "capability": "browser.session.find",
@@ -144,15 +130,11 @@ The planner returns structured JSON actions. Below is a realistic sequence assum
     },
     {
       "capability": "browser.element.inner_text",
-      "input": { "session": "session-1", "element": "greeting" }
+      "input": { "element": "greeting" }
     },
     {
       "capability": "browser.session.screenshot",
-      "input": {
-        "session": "session-1",
-        "kind": "png",
-        "alias": "post-login"
-      }
+      "input": { "session": "session-1" }
     }
   ]
 }
@@ -160,29 +142,33 @@ The planner returns structured JSON actions. Below is a realistic sequence assum
 
 Notes:
 
-- `alias` illustrates how the planner can refer to handles in its own reasoning; the host implementation holds the actual resource handles.
-- Every browser action that produces a new handle (`browser.open_session`, `browser.session.find`, `browser.session.query_all`, etc.) **must** provide a unique `alias`. Reuse that alias via fields like `session` or `element` in subsequent actions.
-- Credential interpolation (`{{creds.username}}`) is done inside the planner after it parses the `fs.read_file` result; the host only sees the literal strings sent via `type_text`.
-- Verification condition is satisfied when `inner_text` contains a phrase like `"Welcome, Demo User"` and the planner returns a `complete` response with that evidence plus the screenshot metadata in `outcome`.
+- Every action that creates a handle (`browser.open_session`, `browser.session.find`) names it with a unique
+  `alias`; later actions refer to it through `session` or `element`.
+- The planner never sees the credentials: it writes `{{secret:demo_username}}`, and the host types the value.
+  If a page or a process echoes a secret back, the host redacts it before the observation reaches the planner.
+- The goal is met when `inner_text` contains the expected greeting (for example `"Welcome, Demo User"`); the
+  planner then returns a `complete` response with that evidence in `result`.
 
 ---
 
 ### 4. Observation contract
 
-The host should feed each capability result back through the observation JSON, e.g.:
+The host feeds each action's result back through the observation JSON, for example:
 
-```json
+```text
 {
   "actions": [
-    { "capability": "fs.read_file", "success": true },
+    { "capability": "browser.element.type_text", "success": true, "output": { "element": "password-field" } },
     { "capability": "browser.element.inner_text", "success": true, "output": { "text": "Welcome, Demo User" } }
   ]
 }
 ```
 
-The planner inspects this structure to decide whether to continue or finish. For login flows, the success predicate might be:
+The planner inspects it to decide whether to continue or finish. For a login flow the success predicate
+might be:
 
 1. `browser.element.inner_text` contains the expected greeting, **and**
-2. `browser.session.describe_page` shows `url` rooted under `/dashboard`.
+2. `browser.session.describe_page` shows a `url` under `/dashboard`.
 
-If either check fails, the planner can emit new actions (e.g., re-open the menu, retry credentials, capture more diagnostics) while staying within the same capability set.
+If either check fails, the planner can emit new actions (re-open the menu, capture more diagnostics) within
+the same capability set and the run's budgets.

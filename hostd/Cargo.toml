@@ -14,7 +14,9 @@ serde_json = "1.0"
 tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "signal", "fs", "time"] }
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+# Output digests in the audit log.
+sha2 = "0.10"
 # One wasmtime major across the portfolio: botwork's 49.x line, at the 49.0.4 advisory floor or later.
 # Only the features hostd uses (botwork's set, plus `anyhow` for its error conversion and parallel
 # compilation, which is host-side only): the defaults would also enable proposals and tooling the

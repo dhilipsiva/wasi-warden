@@ -7,7 +7,9 @@ interface planner {
   record observation {
     step: u32,
     summary: string,
-    data: json
+    data: json,
+    /// The capabilities the host runs: a JSON array of {name, description, input (a JSON schema)}.
+    tools: json
   }
 
   /// Planned capability invocation expressed as structured JSON.
