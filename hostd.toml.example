@@ -28,7 +28,7 @@ model = "phi3.5"
 # filesystem_ops = 10000
 # browser_actions = 200
 # guest_fuel = 10000000000        # wasm work per round; 0 for no limit
-# guest_memory_bytes = 268435456  # the agent's memory
+# guest_memory_bytes = 268435456  # the agent's memories and tables, together
 
 # What the plan may do to the workspace through the fs capability.
 # [workspace]

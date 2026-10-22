@@ -35,8 +35,8 @@ pub struct HostConfig {
 pub struct WorkspaceRules {
     /// Refuse every write: creating, writing, truncating, renaming and removing.
     pub read_only: bool,
-    /// The largest a file may be made by a write (and the most one read returns, with the host's
-    /// own cap).
+    /// The largest a file may be made by a write (`write`, `write-string` and `set-len`, appends
+    /// included). Reads are capped by the host alone (`sandbox::cap_read`).
     pub max_file_bytes: u64,
 }
 
@@ -121,7 +121,10 @@ impl HostConfig {
     }
 }
 
+/// hostd.toml. An unknown key or section is an error, so a misspelt rule (`[workspaces]`) is not
+/// silently dropped.
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     workspace_root: Option<String>,
     allow_proc: Option<Vec<String>>,
@@ -194,6 +197,7 @@ impl FileConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LlmFileSettings {
     api_base: Option<String>,
     api_key: Option<String>,
@@ -235,6 +239,7 @@ fn normalize_path(path: &Path) -> Result<Utf8PathBuf> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BrowserFileSettings {
     webdriver_url: Option<String>,
     default_profile: Option<String>,
@@ -363,6 +368,36 @@ mod tests {
     fn a_malformed_config_is_an_error() {
         let path = write("bad", "allow_proc = \"ls\"\n");
         assert!(HostConfig::from_step_args(&args(&path)).is_err());
+    }
+
+    /// A misspelt section or key is an error, not a rule silently dropped.
+    #[test]
+    fn an_unknown_section_or_key_is_an_error() {
+        for body in [
+            "[workspaces]\nread_only = true\n",
+            "alow_proc = []\n",
+            "[llm]\nmodle = \"m\"\n",
+            "[browser]\nallowed_host = []\n",
+        ] {
+            let path = write("unknown", body);
+            let err = HostConfig::from_step_args(&args(&path))
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {body}"));
+            assert!(format!("{err:#}").contains("unknown"), "{err:#}");
+        }
+    }
+
+    /// The sample configuration, as shipped, loads (its workspace, `./sandbox`, is relative to
+    /// the repository root, so the test supplies one).
+    #[test]
+    fn the_sample_config_loads() {
+        let sample = include_str!("../../hostd.toml.example");
+        let path = write("sample", sample);
+        let mut args = args(&path);
+        args.workspace = path.parent().map(Path::to_path_buf);
+        if let Err(err) = HostConfig::from_step_args(&args) {
+            panic!("{err:#}");
+        }
     }
 
     #[test]

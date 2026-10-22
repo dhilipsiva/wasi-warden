@@ -12,6 +12,13 @@ use wasmtime::component::{Resource, ResourceTableError};
 
 use crate::bindings;
 use crate::browser::{Browser, Select};
+
+/// The largest event (its type and payload) or grant request the agent may log.
+const MAX_EVENT_BYTES: usize = 4096;
+/// The most events and grant requests the agent may log in a run.
+const MAX_EVENTS: u32 = 1000;
+/// The longest one LLM request may take.
+const LLM_TIMEOUT: Duration = Duration::from_secs(60);
 use crate::budget::{self, Kind};
 use crate::config::{HostConfig, LlmSettings};
 use crate::resources::{
@@ -60,10 +67,8 @@ fn require_llm_settings(config: &HostConfig) -> Result<&LlmSettings, CapabilityE
     })
 }
 
-fn http_agent() -> Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(60))
-        .build()
+fn http_agent(timeout: Duration) -> Agent {
+    ureq::AgentBuilder::new().timeout(timeout).build()
 }
 
 fn chat_endpoint(base: &str) -> String {
@@ -157,11 +162,42 @@ struct ChatUsage {
 }
 
 fn convert_usage(usage: Option<ChatUsage>) -> Option<bindings::osagent::llm::llm::TokenUsage> {
-    usage.map(|u| bindings::osagent::llm::llm::TokenUsage {
-        prompt_tokens: u.prompt_tokens.unwrap_or_default(),
-        completion_tokens: u.completion_tokens.unwrap_or_default(),
-        total_tokens: u.total_tokens.unwrap_or_default(),
+    usage.map(|u| {
+        let prompt = u.prompt_tokens.unwrap_or_default();
+        let completion = u.completion_tokens.unwrap_or_default();
+        bindings::osagent::llm::llm::TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: u
+                .total_tokens
+                .unwrap_or_else(|| prompt.saturating_add(completion)),
+        }
     })
+}
+
+/// The tokens a call is charged: the endpoint's total, or its prompt and completion counts, or, when
+/// it reports neither, an estimate of a token per four bytes of the request and the reply. An
+/// endpoint that reports nothing cannot switch the budget off.
+fn tokens_charged(usage: Option<&ChatUsage>, request: &ChatRequest, reply_bytes: usize) -> u64 {
+    let reported =
+        usage.and_then(
+            |u| match (u.total_tokens, u.prompt_tokens, u.completion_tokens) {
+                (Some(total), _, _) if total > 0 => Some(u64::from(total)),
+                (_, None, None) => None,
+                (_, prompt, completion) => {
+                    Some(u64::from(prompt.unwrap_or(0)) + u64::from(completion.unwrap_or(0)))
+                }
+            },
+        );
+    reported.filter(|t| *t > 0).unwrap_or_else(|| {
+        let request_bytes = serde_json::to_vec(request).map(|v| v.len()).unwrap_or(0);
+        ((request_bytes + reply_bytes) as u64).div_ceil(4)
+    })
+}
+
+/// The guest's `max_tokens`, never more than the token budget has left.
+fn clamp_max_tokens(requested: Option<u32>, left: u64) -> Option<u32> {
+    requested.map(|m| m.min(u32::try_from(left).unwrap_or(u32::MAX)))
 }
 
 fn messages_to_chat(messages: Vec<bindings::osagent::llm::llm::Message>) -> Vec<ChatMessage> {
@@ -231,9 +267,10 @@ fn build_chat_request(
 fn execute_chat_request(
     settings: &LlmSettings,
     body: &ChatRequest,
+    timeout: Duration,
 ) -> Result<ChatResponse, CapabilityError> {
     let url = chat_endpoint(&settings.api_base);
-    let agent = http_agent();
+    let agent = http_agent(timeout);
     let token = format!("Bearer {}", settings.api_key);
     let payload = serde_json::to_value(body).map_err(|err| {
         capability_error(
@@ -320,7 +357,9 @@ fn browser_error(err: anyhow::Error) -> CapabilityError {
     ]
     .iter()
     .any(|m| message.contains(m));
-    let code = if refused {
+    let code = if message.contains("browser sessions may be open") {
+        CapabilityErrorCode::Limit
+    } else if refused || message.contains("read-only") {
         CapabilityErrorCode::Denied
     } else {
         CapabilityErrorCode::Internal
@@ -328,12 +367,47 @@ fn browser_error(err: anyhow::Error) -> CapabilityError {
     capability_error(code, message)
 }
 
+/// A refusal because a budget or a cap is spent.
+fn limit(why: impl Into<String>) -> CapabilityError {
+    capability_error(CapabilityErrorCode::Limit, why)
+}
+
 impl HostState {
     /// Pay for one `kind` operation from the run's budgets.
     fn charge(&self, kind: Kind) -> Result<(), CapabilityError> {
         budget::claim(&self.budgets, kind, 1)
             .map(|_| ())
-            .map_err(denied)
+            .map_err(limit)
+    }
+
+    /// Wall-clock time left in the run; none left refuses the call.
+    fn time_left(&self) -> Result<Duration, CapabilityError> {
+        let left = self
+            .budgets
+            .lock()
+            .map(|b| b.remaining_wallclock())
+            .unwrap_or_default();
+        if left.is_zero() {
+            return Err(limit("the wall-clock budget is spent"));
+        }
+        Ok(left)
+    }
+
+    /// Count one event or grant request of `bytes`, within [`MAX_EVENT_BYTES`] and [`MAX_EVENTS`].
+    fn note_event(&mut self, bytes: usize) -> Result<(), CapabilityError> {
+        if bytes > MAX_EVENT_BYTES {
+            return Err(capability_error(
+                CapabilityErrorCode::InvalidArgument,
+                format!("an event may hold at most {MAX_EVENT_BYTES} bytes ({bytes} given)"),
+            ));
+        }
+        if self.events >= MAX_EVENTS {
+            return Err(limit(format!(
+                "the agent may log at most {MAX_EVENTS} events and grant requests in a run"
+            )));
+        }
+        self.events += 1;
+        Ok(())
     }
 
     /// Refuse a write when the workspace is read-only (`[workspace] read_only`).
@@ -351,13 +425,21 @@ impl HostState {
             .lock()
             .map_err(|_| denied("the budgets are unavailable"))?
             .check(Kind::LlmTokens)
-            .map_err(|why| denied(format!("the token budget ran out: {why}")))
+            .map_err(|why| limit(format!("the token budget ran out: {why}")))
     }
 
-    /// Record the tokens a call used.
-    fn spend_tokens(&self, usage: Option<&bindings::osagent::llm::llm::TokenUsage>) {
-        if let (Some(usage), Ok(mut budgets)) = (usage, self.budgets.lock()) {
-            budgets.spend(Kind::LlmTokens, u64::from(usage.total_tokens));
+    /// Tokens left in the run's budget.
+    fn tokens_remaining(&self) -> u64 {
+        self.budgets
+            .lock()
+            .map(|b| b.remaining(Kind::LlmTokens))
+            .unwrap_or_default()
+    }
+
+    /// Record the tokens a call used ([`tokens_charged`]).
+    fn spend_tokens(&self, tokens: u64) {
+        if let Ok(mut budgets) = self.budgets.lock() {
+            budgets.spend(Kind::LlmTokens, tokens);
         }
     }
 
@@ -367,10 +449,18 @@ impl HostState {
             .browser
             .as_ref()
             .ok_or_else(|| denied("browser capability is disabled in host configuration"))?;
+        let remaining = self
+            .budgets
+            .lock()
+            .map(|b| b.remaining_wallclock())
+            .unwrap_or_default();
         Ok(Browser {
             tokio: &self.tokio,
             settings,
             workspace: &self.config.workspace_root,
+            read_only: self.config.workspace_rules.read_only,
+            sessions: &self.sessions,
+            remaining,
         })
     }
 }
@@ -877,11 +967,7 @@ impl bindings::osagent::proc::proc::Host for HostState {
 
         // Runs to completion here (bounded in time and output); the handle then serves its results.
         // Never past the run's wall-clock budget.
-        let remaining = self
-            .budgets
-            .lock()
-            .map(|b| b.remaining_wallclock())
-            .unwrap_or_default();
+        let remaining = self.time_left()?;
         let timeout = sandbox::proc_timeout(options.timeout_ms).min(remaining);
         let output =
             sandbox::run_bounded(cmd, timeout).map_err(|err| io_error("proc.spawn", err))?;
@@ -1279,11 +1365,23 @@ impl bindings::osagent::llm::llm::Host for HostState {
         options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::CompletionResponse, CapabilityError> {
         self.tokens_left()?;
+        let timeout = self.time_left()?.min(LLM_TIMEOUT);
         let settings = require_llm_settings(&self.config)?;
+        let mut options = options;
+        options.max_tokens = clamp_max_tokens(options.max_tokens, self.tokens_remaining());
         let request = build_chat_request(&settings.model, messages, options, None);
-        let response = execute_chat_request(settings, &request)?;
+        let response = execute_chat_request(settings, &request, timeout)?;
+        let reply_bytes = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_ref())
+            .map_or(0, String::len);
+        self.spend_tokens(tokens_charged(
+            response.usage.as_ref(),
+            &request,
+            reply_bytes,
+        ));
         let usage = convert_usage(response.usage);
-        self.spend_tokens(usage.as_ref());
         let mut choices = response.choices.into_iter();
         let choice = choices.next().ok_or_else(|| {
             capability_error(
@@ -1311,12 +1409,22 @@ impl bindings::osagent::llm::llm::Host for HostState {
         options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::ToolResponse, CapabilityError> {
         self.tokens_left()?;
+        let timeout = self.time_left()?.min(LLM_TIMEOUT);
         let settings = require_llm_settings(&self.config)?;
         let chat_tools = tools_to_chat(tools)?;
+        let mut options = options;
+        options.max_tokens = clamp_max_tokens(options.max_tokens, self.tokens_remaining());
         let request = build_chat_request(&settings.model, messages, options, Some(chat_tools));
-        let response = execute_chat_request(settings, &request)?;
+        let response = execute_chat_request(settings, &request, timeout)?;
+        let reply_bytes = response.choices.first().map_or(0, |c| {
+            serde_json::to_vec(&c.message.tool_calls).map_or(0, |v| v.len())
+        });
+        self.spend_tokens(tokens_charged(
+            response.usage.as_ref(),
+            &request,
+            reply_bytes,
+        ));
         let usage = convert_usage(response.usage);
-        self.spend_tokens(usage.as_ref());
         let mut choices = response.choices.into_iter();
         let choice = choices.next().ok_or_else(|| {
             capability_error(
@@ -1422,7 +1530,7 @@ impl bindings::osagent::policy::policy::Host for HostState {
         units: u64,
     ) -> Result<bindings::osagent::policy::policy::BudgetSnapshot, CapabilityError> {
         let kind = kind_of(kind);
-        budget::claim(&self.budgets, kind, units).map_err(denied)?;
+        budget::claim(&self.budgets, kind, units).map_err(limit)?;
         Ok(self.budget_snapshot(kind))
     }
 
@@ -1430,6 +1538,11 @@ impl bindings::osagent::policy::policy::Host for HostState {
         &mut self,
         request: bindings::osagent::policy::policy::GrantRequest,
     ) -> Result<bindings::osagent::policy::policy::GrantResponse, CapabilityError> {
+        self.note_event(
+            request.capability.len()
+                + request.scope.as_ref().map_or(0, String::len)
+                + request.justification.len(),
+        )?;
         tracing::info!(
             target: "audit",
             capability = request.capability,
@@ -1446,6 +1559,7 @@ impl bindings::osagent::policy::policy::Host for HostState {
         &mut self,
         event: bindings::osagent::common::types::AuditEvent,
     ) -> Result<(), CapabilityError> {
+        self.note_event(event.event_type.len() + event.payload.len())?;
         tracing::info!(
             target: "audit",
             event_type = event.event_type,
@@ -1454,5 +1568,61 @@ impl bindings::osagent::policy::policy::Host for HostState {
             "agent event"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(content: &str) -> ChatRequest {
+        let options = bindings::osagent::llm::llm::Options {
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+        };
+        let message = bindings::osagent::llm::llm::Message {
+            role: MessageRole::User,
+            content: content.to_string(),
+            name: None,
+        };
+        build_chat_request("m", vec![message], options, None)
+    }
+
+    fn usage(prompt: Option<u32>, completion: Option<u32>, total: Option<u32>) -> ChatUsage {
+        ChatUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
+        }
+    }
+
+    /// The endpoint's total is charged; without one, its prompt and completion counts; without
+    /// either, an estimate (a token per four bytes), so a silent endpoint still spends the budget.
+    #[test]
+    fn a_call_is_charged_what_the_endpoint_reports_or_an_estimate() {
+        let req = request(&"x".repeat(4000));
+        let reported = usage(Some(10), Some(5), Some(42));
+        assert_eq!(tokens_charged(Some(&reported), &req, 0), 42);
+        let no_total = usage(Some(10), Some(5), None);
+        assert_eq!(tokens_charged(Some(&no_total), &req, 0), 15);
+        let estimate = tokens_charged(None, &req, 400);
+        assert!(estimate >= 1100, "{estimate}");
+        assert_eq!(
+            tokens_charged(Some(&usage(None, None, None)), &req, 400),
+            estimate,
+            "an empty report is no report"
+        );
+    }
+
+    #[test]
+    fn max_tokens_is_clamped_to_the_budget_left() {
+        assert_eq!(clamp_max_tokens(Some(4096), 100), Some(100));
+        assert_eq!(clamp_max_tokens(Some(50), 100), Some(50));
+        assert_eq!(clamp_max_tokens(None, 100), None);
+        assert_eq!(clamp_max_tokens(Some(7), u64::MAX), Some(7));
     }
 }

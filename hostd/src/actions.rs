@@ -13,7 +13,7 @@ use thirtyfour::prelude::*;
 use tokio::runtime::Handle;
 
 use crate::bindings::exports::osagent::agent::planner::PlannedAction;
-use crate::browser::{Browser, Select};
+use crate::browser::{Browser, Select, Sessions};
 use crate::budget::{self, Kind};
 use crate::config::HostConfig;
 use crate::sandbox;
@@ -52,6 +52,7 @@ pub struct ActionExecutor {
     config: HostConfig,
     tokio: Handle,
     budgets: budget::Shared,
+    sessions: Sessions,
     browser_sessions: HashMap<String, WebDriver>,
     browser_elements: HashMap<String, BrowserElementEntry>,
 }
@@ -62,11 +63,17 @@ struct BrowserElementEntry {
 }
 
 impl ActionExecutor {
-    pub fn new(config: HostConfig, tokio: Handle, budgets: budget::Shared) -> Self {
+    pub fn new(
+        config: HostConfig,
+        tokio: Handle,
+        budgets: budget::Shared,
+        sessions: Sessions,
+    ) -> Self {
         Self {
             config,
             tokio,
             budgets,
+            sessions,
             browser_sessions: HashMap::new(),
             browser_elements: HashMap::new(),
         }
@@ -283,10 +290,18 @@ impl ActionExecutor {
             .browser
             .as_ref()
             .ok_or_else(|| anyhow!("browser capability is disabled in host configuration"))?;
+        let remaining = self
+            .budgets
+            .lock()
+            .map(|b| b.remaining_wallclock())
+            .unwrap_or_default();
         Ok(Browser {
             tokio: &self.tokio,
             settings,
             workspace: &self.config.workspace_root,
+            read_only: self.config.workspace_rules.read_only,
+            sessions: &self.sessions,
+            remaining,
         })
     }
 
@@ -584,7 +599,12 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = config(root, allow_proc);
         let budgets = budget::Budgets::shared(config.budgets);
-        let mut executor = ActionExecutor::new(config, runtime.handle().clone(), budgets);
+        let mut executor = ActionExecutor::new(
+            config,
+            runtime.handle().clone(),
+            budgets,
+            Sessions::default(),
+        );
         let action = PlannedAction {
             capability: capability.to_string(),
             input: input.to_string(),

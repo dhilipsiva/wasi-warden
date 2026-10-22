@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -17,10 +18,11 @@ use tokio::runtime::Handle;
 use crate::actions::{ActionExecutor, ActionReport};
 use crate::bindings;
 use crate::bindings::exports::osagent::agent::planner::{AgentError, Observation, StepResponse};
+use crate::browser::Sessions;
 use crate::budget::{self, Budgets, Kind, Limits};
 use crate::cli::StepArgs;
 use crate::config::HostConfig;
-use crate::state::HostState;
+use crate::state::{HostState, OverMemory};
 
 /// Run the plan-act loop for `args`. The loop blocks: wasmtime calls the component synchronously,
 /// the `llm` capability makes blocking HTTP requests, and the executor drives WebDriver futures with
@@ -38,6 +40,52 @@ pub async fn run_step(args: StepArgs) -> Result<()> {
 /// How often the engine's epoch advances: the resolution of the wall-clock interrupt.
 const EPOCH_TICK: Duration = Duration::from_millis(10);
 
+/// How long past its wall-clock budget a run may stay inside one host call before hostd ends it.
+const OVERRUN_GRACE: Duration = Duration::from_secs(5);
+
+/// Ends hostd when the run outlasts its wall-clock budget by [`OVERRUN_GRACE`]. Epochs interrupt a
+/// guest only while it runs wasm; one blocked in a host call (a WASI clock sleep of any length, a page
+/// load, an LLM request) is ended here instead. The run's browser sessions are quit first; its
+/// processes die with hostd (`sandbox::run_bounded`).
+struct Watchdog {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn start(deadline: Option<Instant>, limits: Limits, sessions: Sessions, tokio: Handle) -> Self {
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let thread = deadline.and_then(|deadline| deadline.checked_add(OVERRUN_GRACE)).map(|end| {
+            std::thread::spawn(move || {
+                let wait = end.saturating_duration_since(Instant::now());
+                if let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(wait) {
+                    sessions.quit_all(&tokio, Duration::from_secs(2));
+                    eprintln!(
+                        "Error: the run outlasted its wall-clock budget ({} ms, [budgets] wallclock_ms) \
+                         by {} s inside a host call; hostd stops it",
+                        limits.wallclock_ms,
+                        OVERRUN_GRACE.as_secs()
+                    );
+                    std::process::exit(1);
+                }
+            })
+        });
+        Self {
+            stop: Some(stop),
+            thread,
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Advances the engine's epoch every [`EPOCH_TICK`] until dropped, so a guest past its wall-clock
 /// deadline is interrupted even when it never calls the host.
 struct EpochTicker {
@@ -50,9 +98,17 @@ impl EpochTicker {
         let (engine, stop) = (engine.clone(), Arc::new(AtomicBool::new(false)));
         let running = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
+            // The epoch follows the clock, not the count of sleeps, so a late wakeup does not
+            // push the deadline back.
+            let started = Instant::now();
+            let mut ticks: u128 = 0;
             while !running.load(Ordering::Relaxed) {
                 std::thread::sleep(EPOCH_TICK);
-                engine.increment_epoch();
+                let due = started.elapsed().as_millis() / EPOCH_TICK.as_millis();
+                while ticks < due {
+                    engine.increment_epoch();
+                    ticks += 1;
+                }
             }
         });
         Self {
@@ -84,6 +140,9 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
     let config = HostConfig::from_step_args(&args)?;
     let limits = config.budgets;
     let budgets = Budgets::shared(limits);
+    let sessions = Sessions::default();
+    let deadline = budgets.lock().ok().and_then(|b| b.deadline());
+    let _watchdog = Watchdog::start(deadline, limits, sessions.clone(), tokio_handle.clone());
     let engine = build_engine()?;
     let component = load_component(&engine, &args.component)?;
     let _ticker = EpochTicker::start(&engine);
@@ -102,12 +161,16 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
         .context("failed to add WASI to linker")?;
     bindings::Control::add_to_linker::<_, HasSelf<_>>(&mut linker, |state: &mut HostState| state)?;
 
-    let mut executor =
-        ActionExecutor::new(config.clone(), tokio_handle.clone(), Arc::clone(&budgets));
+    let mut executor = ActionExecutor::new(
+        config.clone(),
+        tokio_handle.clone(),
+        Arc::clone(&budgets),
+        sessions.clone(),
+    );
 
     let mut store = Store::new(
         &engine,
-        HostState::new(config.clone(), Arc::clone(&budgets), tokio_handle),
+        HostState::new(config.clone(), Arc::clone(&budgets), tokio_handle, sessions),
     );
     store.limiter(|state| &mut state.limits);
     // Instantiation runs guest code too, so it is bounded like a round.
@@ -187,8 +250,12 @@ fn bound_round(
     Ok(())
 }
 
-/// Name a guest trap the operator caused by a limit: out of fuel, or past the wall-clock budget.
+/// Name a guest trap the operator caused by a limit: out of fuel, past the wall-clock budget, or
+/// past the memory budget.
 fn guest_stopped(err: wasmtime::Error, limits: Limits) -> anyhow::Error {
+    if let Some(over) = err.downcast_ref::<OverMemory>() {
+        return anyhow!("{over}");
+    }
     match err.downcast_ref::<wasmtime::Trap>() {
         Some(wasmtime::Trap::OutOfFuel) => anyhow!(
             "the agent ran out of fuel ({} units per round, [budgets] guest_fuel)",

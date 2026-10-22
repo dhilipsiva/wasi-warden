@@ -63,7 +63,7 @@ pub struct Limits {
     /// Wasm fuel the agent may burn in one planner round; 0 for no limit (the wall-clock budget
     /// still interrupts it).
     pub guest_fuel: u64,
-    /// The most memory (linear memories, in bytes) the agent's instance may hold.
+    /// The most memory the agent may hold, in bytes: its linear memories and tables together.
     pub guest_memory_bytes: u64,
 }
 
@@ -174,6 +174,17 @@ impl Budgets {
     /// Wall-clock time left in the run.
     pub fn remaining_wallclock(&self) -> Duration {
         Duration::from_millis(self.limits.wallclock_ms).saturating_sub(self.started.elapsed())
+    }
+
+    /// When the wall-clock budget ends (none if it is too far off to represent).
+    pub fn deadline(&self) -> Option<Instant> {
+        self.started
+            .checked_add(Duration::from_millis(self.limits.wallclock_ms))
+    }
+
+    /// How much of `kind` is left.
+    pub fn remaining(&self, kind: Kind) -> u64 {
+        self.limits.of(kind).saturating_sub(self.used(kind))
     }
 }
 

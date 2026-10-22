@@ -4,6 +4,7 @@
 //! checks that the session's page is still on them, because a page can navigate itself. Each call
 //! blocks on the tokio runtime, so it runs on the plan-act loop's blocking thread.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -16,6 +17,44 @@ use crate::sandbox;
 
 /// The longest a visit waits for a page to settle.
 const MAX_SETTLE: Duration = Duration::from_secs(30);
+
+/// The most browser sessions a run may hold open at once, across both executors.
+pub const MAX_SESSIONS: usize = 4;
+
+/// The run's open sessions, shared by both executors: they count against [`MAX_SESSIONS`], and when
+/// the watchdog ends a run it quits whatever is still open.
+#[derive(Clone, Default)]
+pub struct Sessions(Arc<Mutex<Vec<WebDriver>>>);
+
+impl Sessions {
+    fn open_count(&self) -> usize {
+        self.0.lock().map(|s| s.len()).unwrap_or(MAX_SESSIONS)
+    }
+
+    fn add(&self, driver: &WebDriver) {
+        if let Ok(mut sessions) = self.0.lock() {
+            sessions.push(driver.clone());
+        }
+    }
+
+    fn remove(&self, driver: &WebDriver) {
+        if let Ok(mut sessions) = self.0.lock() {
+            sessions.retain(|d| !Arc::ptr_eq(&d.handle, &driver.handle));
+        }
+    }
+
+    /// Quit every open session, waiting at most `each` for each.
+    pub fn quit_all(&self, tokio: &Handle, each: Duration) {
+        let open = self
+            .0
+            .lock()
+            .map(|mut s| std::mem::take(&mut *s))
+            .unwrap_or_default();
+        for driver in open {
+            let _ = tokio.block_on(tokio::time::timeout(each, driver.quit()));
+        }
+    }
+}
 
 /// How an element is found.
 pub enum Select {
@@ -50,6 +89,11 @@ pub struct Browser<'a> {
     pub tokio: &'a Handle,
     pub settings: &'a BrowserSettings,
     pub workspace: &'a Utf8Path,
+    /// The workspace is read-only, so nothing may download into it.
+    pub read_only: bool,
+    pub sessions: &'a Sessions,
+    /// The run's wall-clock time left: no wait runs past it.
+    pub remaining: Duration,
 }
 
 impl Browser<'_> {
@@ -58,8 +102,15 @@ impl Browser<'_> {
     }
 
     /// Open a session. Chrome keeps its sandbox unless `chrome_no_sandbox` is set, and allowed
-    /// downloads land in the workspace.
+    /// downloads land in the workspace (refused when it is read-only). At most [`MAX_SESSIONS`] may
+    /// be open at once.
     pub fn open(&self, headless: bool, allow_downloads: bool) -> Result<WebDriver> {
+        if allow_downloads && self.read_only {
+            bail!("downloads are refused: the workspace is read-only");
+        }
+        if self.sessions.open_count() >= MAX_SESSIONS {
+            bail!("at most {MAX_SESSIONS} browser sessions may be open at once");
+        }
         let url = self.settings.webdriver_url.clone();
         let no_sandbox = self.settings.chrome_no_sandbox;
         let download_dir = self.workspace.to_string();
@@ -85,10 +136,12 @@ impl Browser<'_> {
             }
             WebDriver::new(&url, caps).await
         })
+        .inspect(|driver| self.sessions.add(driver))
     }
 
     /// End a session.
     pub fn quit(&self, driver: WebDriver) {
+        self.sessions.remove(&driver);
         let _ = self.tokio.block_on(driver.quit());
     }
 
@@ -122,7 +175,7 @@ impl Browser<'_> {
     pub fn goto(&self, driver: &WebDriver, url: &str, settle: Duration) -> Result<String> {
         let url = sandbox::check_navigation(url, &self.settings.allowed_hosts)
             .map_err(anyhow::Error::msg)?;
-        let settle = settle.min(MAX_SETTLE);
+        let settle = settle.min(MAX_SETTLE).min(self.remaining);
         {
             let driver = driver.clone();
             self.block_on(async move {
@@ -160,7 +213,7 @@ impl Browser<'_> {
         self.check_page(driver)?;
         let by = select.by()?;
         let driver = driver.clone();
-        let wait = wait.min(MAX_SETTLE);
+        let wait = wait.min(MAX_SETTLE).min(self.remaining);
         self.block_on(async move {
             driver
                 .query(by)
