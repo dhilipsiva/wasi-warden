@@ -90,13 +90,7 @@ impl Watchdog {
                         limits.wallclock_ms,
                         OVERRUN_GRACE.as_secs()
                     );
-                    let (said, heard) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        use std::io::Write;
-                        let _ = std::io::stderr().write_all(message.as_bytes());
-                        let _ = said.send(());
-                    });
-                    let _ = heard.recv_timeout(Duration::from_secs(1));
+                    write_within(std::io::stderr(), message, Duration::from_secs(1));
                     std::process::exit(1);
                 }
             })
@@ -212,14 +206,14 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
         ),
     );
     store.limiter(|state| &mut state.limits);
-    // Instantiation runs guest code too, so it is bounded like a round.
-    bound_round(&mut store, &budgets, limits)?;
-    let control = bindings::Control::instantiate(&mut store, &component, &linker)
-        .map_err(|err| guest_stopped(err, limits))
-        .context("failed to instantiate component")?;
-    let planner = control.osagent_agent_planner();
-
+    // Everything that runs guest code is in here, so every way out of it is cleaned up below.
     let result = (|| -> Result<()> {
+        // Instantiation runs guest code too, so it is bounded like a round.
+        bound_round(&mut store, &budgets, limits)?;
+        let control = bindings::Control::instantiate(&mut store, &component, &linker)
+            .map_err(|err| guest_stopped(err, limits))
+            .context("failed to instantiate component")?;
+        let planner = control.osagent_agent_planner();
         for round in 1.. {
             spent(&budgets, Kind::WallclockMs, "wall-clock")?;
             spent(&budgets, Kind::LlmTokens, "token")?;
@@ -352,20 +346,39 @@ fn build_engine() -> Result<Engine> {
         .context("failed to build Wasmtime engine")
 }
 
+/// `work`'s result if it finishes within `limit`; otherwise none, and `work` is left running on its
+/// thread (until hostd exits).
+fn finish_within<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(work());
+    });
+    finished.recv_timeout(limit).ok()
+}
+
+/// Write `message` to `out`, waiting at most `wait`: a full pipe or a held lock costs the message,
+/// not the caller.
+fn write_within(mut out: impl std::io::Write + Send + 'static, message: String, wait: Duration) {
+    let _ = finish_within(wait, move || {
+        let _ = out.write_all(message.as_bytes());
+        let _ = out.flush();
+    });
+}
+
 /// Compile the component, within [`COMPILE_LIMIT`].
 fn load_component(engine: &Engine, path: &Path) -> Result<Component> {
     let (engine, file) = (engine.clone(), path.to_path_buf());
-    let (done, compiled) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done.send(Component::from_file(&engine, &file));
-    });
-    let component = compiled.recv_timeout(COMPILE_LIMIT).map_err(|_| {
-        anyhow!(
-            "compiling the component {} took longer than {} s",
-            path.display(),
-            COMPILE_LIMIT.as_secs()
-        )
-    })?;
+    let component = finish_within(COMPILE_LIMIT, move || Component::from_file(&engine, &file))
+        .ok_or_else(|| {
+            anyhow!(
+                "compiling the component {} took longer than {} s",
+                path.display(),
+                COMPILE_LIMIT.as_secs()
+            )
+        })?;
     component
         .map_err(anyhow::Error::from)
         .with_context(|| format!("failed to load component {}", path.display()))
@@ -419,6 +432,45 @@ fn build_action_observation(reports: &[ActionReport]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Work that outlasts its limit is given up on; work within it returns its result.
+    #[test]
+    fn finish_within_gives_up_at_the_limit() {
+        let started = std::time::Instant::now();
+        let late = finish_within(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(5));
+            1
+        });
+        assert_eq!(late, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(finish_within(Duration::from_secs(5), || 2), Some(2));
+    }
+
+    /// A writer that never finishes (a full pipe) does not hold the caller past the wait.
+    #[test]
+    fn a_blocked_writer_does_not_hold_the_watchdog() {
+        struct Stuck;
+        impl std::io::Write for Stuck {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_secs(10));
+                Ok(0)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let started = std::time::Instant::now();
+        write_within(Stuck, "message".to_string(), Duration::from_millis(100));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     /// A core module of `sections` (raw section bytes).
     fn module(sections: &[u8]) -> Vec<u8> {

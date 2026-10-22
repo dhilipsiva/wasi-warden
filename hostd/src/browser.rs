@@ -43,13 +43,13 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// Quit `driver`, waiting at most [`QUIT_WAIT`]. A quit that does not finish in time is given up,
-/// and the handle told not to try again when dropped (which would wait without limit).
-fn quit_within(tokio: &Handle, driver: WebDriver) {
+/// Quit `driver`, waiting at most `wait`. A quit that fails or does not finish in time is given
+/// up, and the handle told not to try again when dropped (which would wait up to the WebDriver
+/// client's own timeout).
+fn quit_within(tokio: &Handle, driver: WebDriver, wait: Duration) {
     let quitting = driver.clone();
-    let quit =
-        tokio.block_on(async move { tokio::time::timeout(QUIT_WAIT, quitting.quit()).await });
-    if quit.is_err() {
+    let quit = tokio.block_on(async move { tokio::time::timeout(wait, quitting.quit()).await });
+    if !matches!(quit, Ok(Ok(()))) {
         let _ = driver.leak();
     }
 }
@@ -85,7 +85,7 @@ impl Sessions {
     pub fn quit_all(&self, tokio: &Handle) {
         let open = std::mem::take(&mut *self.open());
         for driver in open {
-            quit_within(tokio, driver);
+            quit_within(tokio, driver, QUIT_WAIT);
         }
     }
 }
@@ -182,7 +182,7 @@ impl Browser<'_> {
     /// End a session, waiting at most [`QUIT_WAIT`].
     pub fn quit(&self, driver: WebDriver) {
         self.sessions.remove(&driver);
-        quit_within(self.tokio, driver);
+        quit_within(self.tokio, driver, QUIT_WAIT);
     }
 
     fn current_url(&self, driver: &WebDriver) -> Result<String> {
@@ -335,5 +335,110 @@ impl Browser<'_> {
         self.check_page(driver)?;
         let driver = driver.clone();
         self.block_on(async move { driver.screenshot_as_png().await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A WebDriver that opens sessions and answers each request to end one after `delay`, with
+    /// HTTP `status`; returns its URL and how many ends it was asked for.
+    fn webdriver(delay: Duration, status: u16) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let quits = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&quits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let count = Arc::clone(&count);
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().expect("clone");
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut length = 0;
+                        loop {
+                            let mut header = String::new();
+                            if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if header == "\r\n" {
+                                break;
+                            }
+                            if let Some(v) =
+                                header.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0; length];
+                        let _ = reader.read_exact(&mut body);
+                        let (code, reply) = if line.starts_with("DELETE") {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(delay);
+                            (status, "{\"value\":null}".to_string())
+                        } else if line.starts_with("POST /session ") {
+                            (
+                                200,
+                                "{\"value\":{\"sessionId\":\"s1\",\"capabilities\":{}}}"
+                                    .to_string(),
+                            )
+                        } else {
+                            (200, "{\"value\":null}".to_string())
+                        };
+                        let _ = write!(
+                            writer,
+                            "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                            reply.len()
+                        );
+                    }
+                });
+            }
+        });
+        (url, quits)
+    }
+
+    fn session(tokio: &tokio::runtime::Runtime, url: &str) -> WebDriver {
+        let url = url.to_string();
+        tokio
+            .block_on(async move { WebDriver::new(&url, DesiredCapabilities::chrome()).await })
+            .expect("session")
+    }
+
+    /// A quit that does not finish in time is given up on, and not tried again when the handle is
+    /// dropped.
+    #[test]
+    fn a_quit_that_times_out_is_not_retried() {
+        let tokio = tokio::runtime::Runtime::new().expect("runtime");
+        let (url, quits) = webdriver(Duration::from_secs(3), 200);
+        let driver = session(&tokio, &url);
+        let started = std::time::Instant::now();
+        quit_within(tokio.handle(), driver, Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(quits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A quit that fails is not tried again when the handle is dropped either.
+    #[test]
+    fn a_failed_quit_is_not_retried() {
+        let tokio = tokio::runtime::Runtime::new().expect("runtime");
+        let (url, quits) = webdriver(Duration::ZERO, 500);
+        let driver = session(&tokio, &url);
+        quit_within(tokio.handle(), driver, Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(quits.load(Ordering::SeqCst), 1);
     }
 }

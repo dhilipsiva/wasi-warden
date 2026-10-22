@@ -123,7 +123,7 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
 * A bounded loop: `hostd step` asks the planner for a plan, executes its actions natively (`hostd/src/actions.rs`)
   and feeds the results back, within the run's budgets (`[budgets]`, below).
 
-What does not work yet (the tests: 63 hostd and 7 agent-core unit tests, and 32 end-to-end tests that run
+What does not work yet (the tests: 67 hostd and 7 agent-core unit tests, and 33 end-to-end tests that run
 the agent, a probe guest of the WIT capabilities and the browser against scripted fakes, in CI):
 
 * **No audit log yet**: capability calls are traced, but there is no structured log of every call with its
