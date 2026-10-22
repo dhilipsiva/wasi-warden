@@ -11,7 +11,7 @@ Run these from the repository root inside `nix develop` (the flake pins Rust wit
 - `cargo build -p hostd` — compile the Rust host.
 - `cargo build -p agent-core --target wasm32-wasip2 --release` — produce the WASI component (`wit-bindgen` generates the bindings; `cargo-component` is not used).
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings` — formatting and lints before every push.
-- `cargo run -p hostd -- step --task "<task>" --observation '{}'` — run the plan-act loop against the compiled guest; it needs `hostd.toml` (copy `hostd.toml.example`) with an LLM endpoint.
+- `cargo run -p hostd -- run --task "<task>"` — run the plan-act loop against the compiled guest (`step` runs one round and prints the next observation); it needs `hostd.toml` (copy `hostd.toml.example`) with an LLM endpoint.
 
 ## Coding Style & Naming Conventions
 Rust code follows default `rustfmt` (4-space indent, trailing commas). Modules stay `snake_case`; exported types use `UpperCamelCase`. WIT packages live under `osagent:*` with verb-style functions (`open_workspace`, `list_dir`). Keep capability structs small, reuse `CapabilityImpl` naming for host adapters, and reserve comments for security rationale.

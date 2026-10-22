@@ -41,7 +41,8 @@ async fn main() -> Result<()> {
     logging::init();
     let cli = Cli::parse();
     match cli.command {
-        Commands::Step(args) => runtime::run_step(args).await?,
+        Commands::Run(args) => runtime::run_step(args, runtime::Mode::Run).await?,
+        Commands::Step(args) => runtime::run_step(args, runtime::Mode::Step).await?,
     }
     Ok(())
 }

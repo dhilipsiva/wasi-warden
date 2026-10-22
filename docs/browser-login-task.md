@@ -36,9 +36,8 @@ against a fake WebDriver, so this page stays true.
 Sample invocation:
 
 ```bash
-cargo run -p hostd -- step \
-  --task "Log into https://demo.example/login with the demo_username and demo_password secrets and confirm the dashboard greets the user." \
-  --observation '{}'
+cargo run -p hostd -- run \
+  --task "Log into https://demo.example/login with the demo_username and demo_password secrets and confirm the dashboard greets the user."
 ```
 
 ---

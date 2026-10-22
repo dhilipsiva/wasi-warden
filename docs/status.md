@@ -1,5 +1,8 @@
 ## Project Status — Host Execution Loop + Browser Automation
 
+> A snapshot of 2025-11-14, kept as history; much of it is out of date. The README's Status section is
+> current.
+
 _Last updated: 2025-11-14_
 
 ### What’s Working

@@ -19,7 +19,7 @@ Think: **computer-use / RPA / ops runbooks**, but:
 For instance, a browser login task, whose credentials are host-side secrets the model never sees:
 
 ```
-cargo run -p hostd -- step \
+cargo run -p hostd -- run \
   --task "Log into https://demo.example/login with the demo_username and demo_password secrets and confirm the dashboard greets the user."
 ```
 
@@ -122,10 +122,10 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
   capabilities the host sends it (`hostd/src/registry.rs`, the same list the host dispatches on), calls the
   `llm` capability and parses the returned JSON plan. A reply that is not a plan is answered once with what
   was wrong; it calls no other capability itself.
-* A bounded loop: `hostd step` asks the planner for a plan, executes its actions natively (`hostd/src/actions.rs`)
+* A bounded loop: `hostd run` asks the planner for a plan, executes its actions natively (`hostd/src/actions.rs`)
   and feeds the results back, within the run's budgets (`[budgets]`, below).
 
-What does not work yet (the tests: 81 hostd and 7 agent-core unit tests, and 45 end-to-end tests that run
+What does not work yet (the tests: 81 hostd and 7 agent-core unit tests, and 47 end-to-end tests that run
 the agent, a probe guest of the WIT capabilities and the browser against scripted fakes, in CI):
 
 * **No input backend**: every `input` call is refused, and so is the browser's script evaluation.
@@ -158,7 +158,7 @@ the agent, a probe guest of the WIT capabilities and the browser against scripte
     `contents` only by size) but not its list arguments, such as bytes and messages, which the tracing
     elides; outputs are recorded only as SHA-256 digests.
 
-Expect breaking changes. The progress snapshot is in [docs/status.md](docs/status.md).
+Expect breaking changes. [docs/status.md](docs/status.md) is a snapshot from November 2025, kept as history.
 
 ---
 
@@ -217,12 +217,14 @@ nix develop                                               # the pinned toolchain
 cargo build -p hostd                                      # the host
 cargo build -p agent-core --target wasm32-wasip2 --release  # the agent component
 cp hostd.toml.example hostd.toml                          # then edit: workspace, allowlist, LLM endpoint
-cargo run -p hostd -- step --task "List workspace files" --observation '{}'
+cargo run -p hostd -- run --task "List workspace files"
 ```
 
-`hostd step` loads `./target/wasm32-wasip2/release/agent_core.wasm` (`--component` to change it), asks the
+`hostd run` loads `./target/wasm32-wasip2/release/agent_core.wasm` (`--component` to change it), asks the
 planner for a JSON plan, runs the allowed actions, and repeats with their results until the planner reports
-the task complete or a budget runs out (8 rounds by default). `hostd step --help` lists the flags.
+the task complete or a budget runs out (8 rounds by default). `hostd step` runs one round instead and prints
+where it got to as JSON: the next step and its observation, to pass back with `--step` and `--observation`,
+or the completion. `hostd run --help` and `hostd step --help` list the flags.
 
 To try browser tasks, point the host at a running WebDriver (Chromedriver, Geckodriver, etc.) in `hostd.toml`:
 

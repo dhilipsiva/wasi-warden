@@ -33,11 +33,31 @@ use crate::telemetry::Telemetry;
 /// where `block_on` is allowed, and the executor's `Drop` (which quits browser sessions) runs there
 /// too. A blocking-pool thread has tokio's 2 MiB stack (the main thread has 8 MiB); that is ample for
 /// the host side of the loop, and the guest runs on wasmtime's own bounded wasm stack (512 KiB).
-pub async fn run_step(args: StepArgs) -> Result<()> {
+pub async fn run_step(args: StepArgs, mode: Mode) -> Result<()> {
     let tokio_handle = Handle::current();
-    tokio::task::spawn_blocking(move || run_step_blocking(args, tokio_handle))
+    tokio::task::spawn_blocking(move || run_step_blocking(args, tokio_handle, mode))
         .await
         .context("the step thread panicked")?
+}
+
+/// How far a run goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Rounds until the planner completes the task or a budget runs out (`hostd run`).
+    Run,
+    /// One round, then where it got to printed as JSON on stdout (`hostd step`).
+    Step,
+}
+
+/// What `hostd step` prints after a round that continues: the next step and the observation to
+/// pass back with `--step` and `--observation`.
+fn print_continue(step: u32, observation: &Observation) -> Result<()> {
+    let data: Value = serde_json::from_str(&observation.data).context("the observation")?;
+    println!(
+        "{}",
+        json!({ "status": "continue", "step": step, "summary": observation.summary, "observation": data })
+    );
+    Ok(())
 }
 
 /// How often the engine's epoch advances: the resolution of the wall-clock interrupt.
@@ -164,7 +184,7 @@ fn spent(budgets: &budget::Shared, kind: Kind, what: &str) -> Result<()> {
     check.map_err(|why| anyhow!("the {what} budget ran out before the planner completed: {why}"))
 }
 
-fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
+fn run_step_blocking(args: StepArgs, tokio_handle: Handle, mode: Mode) -> Result<()> {
     let config = HostConfig::from_step_args(&args)?;
     let limits = config.budgets;
     let engine = build_engine()?;
@@ -270,6 +290,9 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
                         data: build_action_observation(&reports)?,
                         tools: tools.clone(),
                     };
+                    if mode == Mode::Step {
+                        return print_continue(current_step, &observation);
+                    }
                 }
                 StepResponse::Complete(done) => {
                     info!(
@@ -278,6 +301,14 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
                         total_steps = round,
                         "planner completed task"
                     );
+                    if mode == Mode::Step {
+                        let outcome: Value = serde_json::from_str(&done.outcome)
+                            .unwrap_or_else(|_| Value::String(done.outcome.clone()));
+                        println!(
+                            "{}",
+                            json!({ "status": "complete", "step": current_step, "reason": done.reason, "outcome": outcome })
+                        );
+                    }
                     return Ok(());
                 }
             }

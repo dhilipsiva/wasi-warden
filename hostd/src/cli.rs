@@ -12,7 +12,10 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Run a single planning step with the configured component.
+    /// Run the task: planner rounds until the planner completes it or a budget runs out.
+    Run(StepArgs),
+    /// Run one planner round and print where it got to as JSON: the next step and its observation
+    /// (pass them back with --step and --observation), or the completion.
     Step(StepArgs),
 }
 
