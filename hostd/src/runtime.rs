@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -43,6 +43,26 @@ const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// How long past its wall-clock budget a run may stay inside one host call before hostd ends it.
 const OVERRUN_GRACE: Duration = Duration::from_secs(5);
 
+/// The longest compiling the component may take. Compiling comes before the run's clock starts, and
+/// the component is the agent's code, so it is capped here.
+const COMPILE_LIMIT: Duration = Duration::from_secs(120);
+
+/// The most actions one plan runs; the rest are reported as not run.
+const MAX_ACTIONS_PER_PLAN: usize = 32;
+
+/// The most of a guest-written string (a thought, an outcome, an error) a log line holds.
+const LOG_FIELD_CHARS: usize = 256;
+
+/// `text`, cut to [`LOG_FIELD_CHARS`] for a log line.
+fn clip(text: &str) -> String {
+    let chars = text.chars().count();
+    if chars <= LOG_FIELD_CHARS {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(LOG_FIELD_CHARS).collect();
+    format!("{kept}… ({chars} chars)")
+}
+
 /// Ends hostd when the run outlasts its wall-clock budget by [`OVERRUN_GRACE`]. Epochs interrupt a
 /// guest only while it runs wasm; one blocked in a host call (a WASI clock sleep of any length, a page
 /// load, an LLM request) is ended here instead. The run's browser sessions are quit first; its
@@ -59,13 +79,24 @@ impl Watchdog {
             std::thread::spawn(move || {
                 let wait = end.saturating_duration_since(Instant::now());
                 if let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(wait) {
-                    sessions.quit_all(&tokio, Duration::from_secs(2));
-                    eprintln!(
+                    // hostd exits whatever happens here: a cleanup that panics or a stderr that
+                    // blocks only costs the cleanup or the message.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sessions.quit_all(&tokio)
+                    }));
+                    let message = format!(
                         "Error: the run outlasted its wall-clock budget ({} ms, [budgets] wallclock_ms) \
-                         by {} s inside a host call; hostd stops it",
+                         by {} s inside a host call; hostd stops it\n",
                         limits.wallclock_ms,
                         OVERRUN_GRACE.as_secs()
                     );
+                    let (said, heard) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        use std::io::Write;
+                        let _ = std::io::stderr().write_all(message.as_bytes());
+                        let _ = said.send(());
+                    });
+                    let _ = heard.recv_timeout(Duration::from_secs(1));
                     std::process::exit(1);
                 }
             })
@@ -147,7 +178,7 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
     let budgets = Budgets::shared(limits);
     let sessions = Sessions::default();
     let deadline = budgets.lock().ok().and_then(|b| b.deadline());
-    let _watchdog = Watchdog::start(deadline, limits, sessions.clone(), tokio_handle.clone());
+    let watchdog = Watchdog::start(deadline, limits, sessions.clone(), tokio_handle.clone());
     let _ticker = EpochTicker::start(&engine);
 
     let observation_json = validate_json(&args.observation)?;
@@ -173,7 +204,12 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
 
     let mut store = Store::new(
         &engine,
-        HostState::new(config.clone(), Arc::clone(&budgets), tokio_handle, sessions),
+        HostState::new(
+            config.clone(),
+            Arc::clone(&budgets),
+            tokio_handle.clone(),
+            sessions.clone(),
+        ),
     );
     store.limiter(|state| &mut state.limits);
     // Instantiation runs guest code too, so it is bounded like a round.
@@ -183,52 +219,73 @@ fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
         .context("failed to instantiate component")?;
     let planner = control.osagent_agent_planner();
 
-    for round in 1.. {
-        spent(&budgets, Kind::WallclockMs, "wall-clock")?;
-        spent(&budgets, Kind::LlmTokens, "token")?;
-        if budget::claim(&budgets, Kind::Steps, 1).is_err() {
-            bail!(
-                "the step budget ({} rounds) ran out before the planner completed (last summary: {})",
-                limits.steps,
-                observation.summary
-            );
-        }
-        bound_round(&mut store, &budgets, limits)?;
-        let planner_result = planner
-            .call_step(&mut store, &args.task, &observation)
-            .map_err(|err| guest_stopped(err, limits))
-            .context("planner.step failed")?;
-        let response = planner_result.map_err(agent_failure)?;
+    let result = (|| -> Result<()> {
+        for round in 1.. {
+            spent(&budgets, Kind::WallclockMs, "wall-clock")?;
+            spent(&budgets, Kind::LlmTokens, "token")?;
+            if budget::claim(&budgets, Kind::Steps, 1).is_err() {
+                bail!(
+                    "the step budget ({} rounds) ran out before the planner completed (last summary: {})",
+                    limits.steps,
+                    observation.summary
+                );
+            }
+            bound_round(&mut store, &budgets, limits)?;
+            let planner_result = planner
+                .call_step(&mut store, &args.task, &observation)
+                .map_err(|err| guest_stopped(err, limits))
+                .context("planner.step failed")?;
+            let response = planner_result.map_err(agent_failure)?;
 
-        match response {
-            StepResponse::Continue(plan) => {
-                info!(
-                    step = current_step,
-                    thought = plan.thought,
-                    actions = plan.actions.len(),
-                    "planner requested capability executions"
-                );
-                let reports = executor.execute(&plan.actions);
-                log_action_reports(&reports);
-                current_step = current_step.saturating_add(1);
-                observation = Observation {
-                    step: current_step,
-                    summary: summarize_reports(&reports),
-                    data: build_action_observation(&reports)?,
-                };
-            }
-            StepResponse::Complete(done) => {
-                info!(
-                    reason = done.reason,
-                    outcome = done.outcome,
-                    total_steps = round,
-                    "planner completed task"
-                );
-                return Ok(());
+            match response {
+                StepResponse::Continue(plan) => {
+                    info!(
+                        step = current_step,
+                        thought = clip(&plan.thought),
+                        actions = plan.actions.len(),
+                        "planner requested capability executions"
+                    );
+                    let (run, past) = plan
+                        .actions
+                        .split_at(plan.actions.len().min(MAX_ACTIONS_PER_PLAN));
+                    let mut reports = executor.execute(run);
+                    if !past.is_empty() {
+                        reports.push(ActionReport::failed(
+                            "plan".to_string(),
+                            anyhow!(
+                                "{} more actions were not run: a plan runs at most {MAX_ACTIONS_PER_PLAN}",
+                                past.len()
+                            ),
+                        ));
+                    }
+                    log_action_reports(&reports);
+                    current_step = current_step.saturating_add(1);
+                    observation = Observation {
+                        step: current_step,
+                        summary: summarize_reports(&reports),
+                        data: build_action_observation(&reports)?,
+                    };
+                }
+                StepResponse::Complete(done) => {
+                    info!(
+                        reason = clip(&done.reason),
+                        outcome = clip(&done.outcome),
+                        total_steps = round,
+                        "planner completed task"
+                    );
+                    return Ok(());
+                }
             }
         }
-    }
-    unreachable!("the step budget ends the loop")
+        unreachable!("the step budget ends the loop")
+    })();
+    // The run is over: the watchdog stands down, and the sessions it would have quit are quit
+    // here, each within browser::QUIT_WAIT, so a run that completed is not then ended as overdue.
+    drop(watchdog);
+    drop(executor);
+    drop(store);
+    sessions.quit_all(&tokio_handle);
+    result
 }
 
 /// Give the guest its fuel for one round (`guest_fuel`; 0 for none) and an epoch deadline at the
@@ -279,13 +336,37 @@ fn build_engine() -> Result<Engine> {
     config.wasm_component_model(true);
     config.consume_fuel(true);
     config.epoch_interruption(true);
+    // Off, as the memory budget cannot hold them (GuestLimiter): 64-bit memories and tables (an
+    // overflowing table growth reaches the limiter as a failure it never approved), shared memories
+    // (never shown to it), several memories in one module, and the GC heap.
+    config.wasm_memory64(false);
+    config.wasm_features(wasmtime::WasmFeatures::THREADS, false);
+    config.wasm_shared_everything_threads(false);
+    config.wasm_multi_memory(false);
+    config.wasm_gc(false);
+    config.wasm_features(wasmtime::WasmFeatures::FUNCTION_REFERENCES, false);
+    config.wasm_custom_page_sizes(false);
+    config.wasm_stack_switching(false);
     Engine::new(&config)
         .map_err(anyhow::Error::from)
         .context("failed to build Wasmtime engine")
 }
 
-fn load_component(engine: &Engine, path: &PathBuf) -> Result<Component> {
-    Component::from_file(engine, path)
+/// Compile the component, within [`COMPILE_LIMIT`].
+fn load_component(engine: &Engine, path: &Path) -> Result<Component> {
+    let (engine, file) = (engine.clone(), path.to_path_buf());
+    let (done, compiled) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(Component::from_file(&engine, &file));
+    });
+    let component = compiled.recv_timeout(COMPILE_LIMIT).map_err(|_| {
+        anyhow!(
+            "compiling the component {} took longer than {} s",
+            path.display(),
+            COMPILE_LIMIT.as_secs()
+        )
+    })?;
+    component
         .map_err(anyhow::Error::from)
         .with_context(|| format!("failed to load component {}", path.display()))
 }
@@ -307,11 +388,11 @@ fn agent_failure(err: AgentError) -> anyhow::Error {
 fn log_action_reports(reports: &[ActionReport]) {
     for report in reports {
         if report.success {
-            debug!(capability = report.capability, "action succeeded");
+            debug!(capability = clip(&report.capability), "action succeeded");
         } else {
             warn!(
-                capability = report.capability,
-                error = report.error.as_deref().unwrap_or("unknown failure"),
+                capability = clip(&report.capability),
+                error = clip(report.error.as_deref().unwrap_or("unknown failure")),
                 "action failed"
             );
         }

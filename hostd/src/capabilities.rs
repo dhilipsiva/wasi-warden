@@ -11,7 +11,7 @@ use ureq::Agent;
 use wasmtime::component::{Resource, ResourceTableError};
 
 use crate::bindings;
-use crate::browser::{Browser, Select};
+use crate::browser::{self, Browser, Select};
 
 /// The largest event (its type and payload) or grant request the agent may log.
 const MAX_EVENT_BYTES: usize = 4096;
@@ -346,25 +346,15 @@ fn denied(why: impl Into<String>) -> CapabilityError {
     capability_error(CapabilityErrorCode::Denied, why)
 }
 
-/// A browser failure: a refusal by the host's rules is `denied`, anything else `internal`.
+/// A browser failure: a refusal by the host's rules is `denied`, one past a cap `limit`, anything
+/// else `internal`. The browser says which ([`browser::Refusal`]); the message is not consulted.
 fn browser_error(err: anyhow::Error) -> CapabilityError {
-    let message = err.to_string();
-    let refused = [
-        "allowed hosts",
-        "allowed_hosts",
-        "only http and https",
-        "is not a URL",
-    ]
-    .iter()
-    .any(|m| message.contains(m));
-    let code = if message.contains("browser sessions may be open") {
-        CapabilityErrorCode::Limit
-    } else if refused || message.contains("read-only") {
-        CapabilityErrorCode::Denied
-    } else {
-        CapabilityErrorCode::Internal
+    let code = match err.downcast_ref::<browser::Refusal>() {
+        Some(browser::Refusal::Denied(_)) => CapabilityErrorCode::Denied,
+        Some(browser::Refusal::Limit(_)) => CapabilityErrorCode::Limit,
+        None => CapabilityErrorCode::Internal,
     };
-    capability_error(code, message)
+    capability_error(code, err.to_string())
 }
 
 /// A refusal because a budget or a cap is spent.

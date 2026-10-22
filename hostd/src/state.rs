@@ -79,20 +79,18 @@ impl std::error::Error for OverMemory {}
 /// Caps the agent's memory in total: its linear memories and its tables (a pointer per element)
 /// together. wasmtime's own `StoreLimits` caps each linear memory on its own, and a component may
 /// hold many, so a guest could multiply its share.
+///
+/// A growth is counted once allowed, and stays counted even if it then fails: wasmtime also reports
+/// failures it never asked about (a 64-bit table growth whose size overflows), so taking one back
+/// would let a guest grow for free.
 pub struct GuestLimiter {
     limit: u64,
     used: u64,
-    /// The last growth allowed, taken back if it then fails.
-    pending: u64,
 }
 
 impl GuestLimiter {
     pub fn new(limit: u64) -> Self {
-        Self {
-            limit,
-            used: 0,
-            pending: 0,
-        }
+        Self { limit, used: 0 }
     }
 
     fn grow(&mut self, current: u64, desired: u64) -> wasmtime::Result<bool> {
@@ -102,13 +100,7 @@ impl GuestLimiter {
             return Err(wasmtime::Error::new(OverMemory { limit: self.limit }));
         }
         self.used = total;
-        self.pending = added;
         Ok(true)
-    }
-
-    fn take_back(&mut self) {
-        self.used = self.used.saturating_sub(self.pending);
-        self.pending = 0;
     }
 }
 
@@ -131,11 +123,6 @@ impl ResourceLimiter for GuestLimiter {
         self.grow(current as u64, desired as u64)
     }
 
-    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
-        self.take_back();
-        Ok(())
-    }
-
     fn table_growing(
         &mut self,
         current: usize,
@@ -146,11 +133,6 @@ impl ResourceLimiter for GuestLimiter {
             return Ok(false);
         }
         self.grow(table_bytes(current), table_bytes(desired))
-    }
-
-    fn table_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
-        self.take_back();
-        Ok(())
     }
 
     fn instances(&self) -> usize {

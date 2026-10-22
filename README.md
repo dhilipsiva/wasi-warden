@@ -123,7 +123,7 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
 * A bounded loop: `hostd step` asks the planner for a plan, executes its actions natively (`hostd/src/actions.rs`)
   and feeds the results back, within the run's budgets (`[budgets]`, below).
 
-What does not work yet (the tests: 62 hostd and 7 agent-core unit tests, and 26 end-to-end tests that run
+What does not work yet (the tests: 63 hostd and 7 agent-core unit tests, and 32 end-to-end tests that run
 the agent, a probe guest of the WIT capabilities and the browser against scripted fakes, in CI):
 
 * **No audit log yet**: capability calls are traced, but there is no structured log of every call with its
@@ -149,8 +149,10 @@ the agent, a probe guest of the WIT capabilities and the browser against scripte
     anything, and ports are not constrained. Waits for a page are capped by the run's time left, but a page
     load (60 s) and a single WebDriver request (120 s) are not; the watchdog below ends a run they overrun.
   * **The watchdog ends hostd outright.** A run still inside a host call 5 s after its wall-clock budget is
-    stopped by exiting the process: its browser sessions are quit and its processes die with it, but a
-    file the run was writing may be left half-written.
+    stopped by exiting the process: its browser sessions are quit (each within 5 s; one still being
+    opened is not) and its processes die with it, but a file the run was writing may be left
+    half-written.
+  * **Compiling the component** comes before the run's clock starts; it is capped at 120 s instead.
 
 Expect breaking changes. The progress snapshot is in [docs/status.md](docs/status.md).
 
@@ -283,14 +285,18 @@ The design's rules:
   * `guest_fuel` (10,000,000,000 per round; 0 for no limit): wasm work, so a guest that computes forever is
     stopped.
   * `guest_memory_bytes` (256 MiB): the agent's linear memories and tables together (a component may hold
-    several); a growth past it stops the agent with the budget named. It may create at most 16 memories,
-    64 tables and 256 instances.
+    several); a growth past it stops the agent with the budget named, and a growth is counted even if it
+    then fails. It may create at most 16 memories, 64 tables and 256 instances, and the engine refuses
+    what the budget cannot hold: 64-bit memories and tables, shared memories, several memories in one
+    module, and GC.
 * **Workspace rules** (`[workspace]`): `read_only` refuses every write through the fs capability, and
   `max_file_bytes` (16 MiB) caps how large a write may make a file. Allowlisted programs run with the host's
   permissions and are not bound by these.
 * **The policy capability** reports these rules and budgets to the guest and lets it spend its budgets and log
   events (to the `audit` tracing target; at most 1,000 events and grant requests a run, 4 KiB each); no
   grant can widen the policy.
+* **The planner's plans** run at most 32 actions each; the rest are reported as not run. A log line holds at
+  most 256 characters of anything the agent wrote (a thought, an outcome, an error).
 * **Configuration** is read strictly: an unknown key or section in hostd.toml (`[workspaces]`) is an error,
   not a rule silently dropped. The log lines go to stderr.
 * **The WIT browser interface** follows the same rules as the planner's browser actions; script evaluation is

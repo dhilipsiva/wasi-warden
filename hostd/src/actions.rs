@@ -36,7 +36,7 @@ impl ActionReport {
         }
     }
 
-    fn failed(capability: String, err: anyhow::Error) -> Self {
+    pub(crate) fn failed(capability: String, err: anyhow::Error) -> Self {
         Self {
             capability,
             success: false,
