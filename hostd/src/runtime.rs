@@ -24,7 +24,8 @@ const MAX_HOST_STEPS: u32 = 8;
 /// the `llm` capability makes blocking HTTP requests, and the executor drives WebDriver futures with
 /// `Handle::block_on`, which panics on a runtime worker thread. So it runs on a blocking thread,
 /// where `block_on` is allowed, and the executor's `Drop` (which quits browser sessions) runs there
-/// too.
+/// too. A blocking-pool thread has tokio's 2 MiB stack (the main thread has 8 MiB); that is ample for
+/// the host side of the loop, and the guest runs on wasmtime's own bounded wasm stack (512 KiB).
 pub async fn run_step(args: StepArgs) -> Result<()> {
     let tokio_handle = Handle::current();
     tokio::task::spawn_blocking(move || run_step_blocking(args, tokio_handle))

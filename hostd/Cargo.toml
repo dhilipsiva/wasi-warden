@@ -16,7 +16,11 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # One wasmtime major across the portfolio: botwork's 49.x line, at the 49.0.4 advisory floor or later.
-wasmtime = { version = "49.0.4", features = ["component-model"] }
+# Only the features hostd uses (botwork's set, plus `anyhow` for its error conversion and parallel
+# compilation, which is host-side only): the defaults would also enable proposals and tooling the
+# host never needs (component-model-async, stack switching, GC, threads, wat, the compile cache), each
+# more surface for a guest to reach.
+wasmtime = { version = "49.0.4", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "backtrace", "demangle", "anyhow", "parallel-compilation"] }
 wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
 ureq = { version = "2.10.0", default-features = false, features = ["tls", "json"] }
 base64 = "0.22"
