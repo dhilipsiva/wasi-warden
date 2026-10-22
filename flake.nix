@@ -82,6 +82,7 @@
           packages = [
             rustToolchain
             pkgs.pkg-config
+            pkgs.just # the local gate (Justfile)
             pkgs.cargo-deny
             # Browser tasks talk to a WebDriver; chromedriver drives the Chromium it ships with.
             pkgs.chromedriver

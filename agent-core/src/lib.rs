@@ -65,13 +65,31 @@ fn plan_with_llm(
     plan_from_content(&completion.content)
 }
 
+/// The JSON inside a Markdown code fence (```` ```json ```` or a bare ```` ``` ````), or the reply
+/// itself when it is not fenced. Models often fence their JSON despite the prompt.
+fn strip_code_fence(content: &str) -> &str {
+    let trimmed = content.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some(body) = rest.strip_suffix("```") else {
+        return trimmed;
+    };
+    // The opening fence's line may name a language (`json`); the JSON starts on the next line.
+    match body.split_once('\n') {
+        Some((info, json)) if !info.trim_start().starts_with('{') => json.trim(),
+        _ => body.trim(),
+    }
+}
+
 /// The step response the model's reply `content` describes.
 fn plan_from_content(content: &str) -> Result<StepResponse, AgentErr> {
-    let envelope: PlanEnvelope = serde_json::from_str(content).map_err(|err| {
-        AgentErr::fatal(format!(
-            "failed to parse LLM response: {err}; content: {content}"
-        ))
-    })?;
+    let envelope: PlanEnvelope =
+        serde_json::from_str(strip_code_fence(content)).map_err(|err| {
+            AgentErr::fatal(format!(
+                "failed to parse LLM response: {err}; content: {content}"
+            ))
+        })?;
 
     match envelope.status {
         PlanStatus::Continue => {
@@ -247,6 +265,18 @@ mod tests {
             matches!(plan(&fenced), Ok(StepResponse::Continue(_))),
             "{fenced}"
         );
+    }
+
+    #[test]
+    fn a_fence_is_stripped_only_when_it_closes() {
+        assert_eq!(strip_code_fence("```json\n{}\n```"), "{}");
+        assert_eq!(strip_code_fence("```{\"a\":1}```"), "{\"a\":1}");
+        assert_eq!(
+            strip_code_fence("```json\n{}"),
+            "```json\n{}",
+            "an unclosed fence is left alone"
+        );
+        assert_eq!(strip_code_fence("  {}  "), "{}");
     }
 
     #[test]

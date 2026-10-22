@@ -7,6 +7,7 @@ The workspace has three code directories: `hostd/` (the privileged Rust host), `
 
 ## Build, Test, and Development Commands
 Run these from the repository root inside `nix develop` (the flake pins Rust with the `wasm32-wasip2` target):
+- `just ci` — the gate CI runs: fmt, clippy `-D warnings`, the unit tests, docs, `cargo deny`, the WIT parse, the component build and both end-to-end tests (`just --list` shows each recipe).
 - `cargo build -p hostd` — compile the Rust host.
 - `cargo build -p agent-core --target wasm32-wasip2 --release` — produce the WASI component (`wit-bindgen` generates the bindings; `cargo-component` is not used).
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings` — formatting and lints before every push.
@@ -16,7 +17,7 @@ Run these from the repository root inside `nix develop` (the flake pins Rust wit
 Rust code follows default `rustfmt` (4-space indent, trailing commas). Modules stay `snake_case`; exported types use `UpperCamelCase`. WIT packages live under `osagent:*` with verb-style functions (`open_workspace`, `list_dir`). Keep capability structs small, reuse `CapabilityImpl` naming for host adapters, and reserve comments for security rationale.
 
 ## Testing Guidelines
-The tests so far are end to end: `hostd/tests/step_e2e.rs` (a step against a scripted LLM) and `hostd/tests/browser_e2e.rs` (a browser session against a fake WebDriver), with shared helpers in `hostd/tests/support/`. They are ignored until the component is built (`cargo test -p hostd -- --include-ignored`). Add unit tests alongside modules using Rust’s `mod tests`. Integration coverage belongs in `hostd/tests/` and should exercise real capability flows via allowlisted commands (e.g., `cargo test -p hostd -- --nocapture`). Test the guest's prompt building and plan parsing as plain Rust unit tests in `agent-core`, with fixture observations. Name tests after behavior (`handles_missing_policy`, `denies_unlisted_proc`) and pair every bug fix with a regression.
+Unit tests live beside their modules (`hostd/src/*.rs`, `agent-core/src/lib.rs`). The end-to-end tests, `hostd/tests/step_e2e.rs` (a step against a scripted LLM) and `hostd/tests/browser_e2e.rs` (a browser session against a fake WebDriver), share helpers in `hostd/tests/support/` and are ignored until the component is built (`just e2e step_e2e`). Tests marked `known gap` record security gaps and are un-ignored by the fix that closes each. Add unit tests alongside modules using Rust’s `mod tests`. Integration coverage belongs in `hostd/tests/` and should exercise real capability flows via allowlisted commands (e.g., `cargo test -p hostd -- --nocapture`). Test the guest's prompt building and plan parsing as plain Rust unit tests in `agent-core`, with fixture observations. Name tests after behavior (`handles_missing_policy`, `denies_unlisted_proc`) and pair every bug fix with a regression.
 
 ## Commit & Pull Request Guidelines
 History shows short, imperative commit titles (“add getting started guide”). Keep subject ≤50 chars, follow with a blank line, then detail the why/impact. Pull requests must cite related issues, describe policy implications, and include screenshots or logs when touching CLI UX. Call out any new capabilities, config knobs, or security-sensitive default changes.

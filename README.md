@@ -1,7 +1,7 @@
 # wasi-warden
 
-> **Status: design spike, Nov 2025.** Two end-to-end tests; policy, budgets, audit and fuel are
-> unimplemented; do not run it on a machine or data you care about.
+> **Status: design spike, Nov 2025.** Policy, budgets, audit and fuel are unimplemented, and known
+> sandbox gaps are open; do not run it on a machine or data you care about.
 > What works and what does not is listed under [Status](#status).
 
 Secure, local-first OS automation for LLMs: the design.
@@ -125,9 +125,10 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
 
 What does not work yet:
 
-* **Two tests**: `hostd/tests/step_e2e.rs` runs a step end to end against a scripted LLM, and
-  `hostd/tests/browser_e2e.rs` opens, navigates and quits a browser session against a fake WebDriver. Both need
-  the agent component built first (`cargo test -p hostd -- --include-ignored`). There is no CI yet.
+* **Tests cover the host's own logic, not its security**: 33 unit tests (path resolution, the fs and proc
+  actions, configuration, the plan parser) and two end-to-end tests (a step against a scripted LLM, a browser
+  session against a fake WebDriver) run in CI. Three more tests record the security gaps below and are ignored
+  until they are fixed.
 * **The planner's prompt lists only `fs.list_dir`, `fs.read_file` and `proc.spawn`**, though the host runs eleven
   actions, browser ones included; a model has to guess the rest.
 * **Nothing is enforced beyond the round cap**: no wasm fuel or epoch limit, no wall-clock or token budget, no
