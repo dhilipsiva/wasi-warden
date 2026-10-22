@@ -1,7 +1,7 @@
 # wasi-warden
 
-> **Status: design spike, Nov 2025.** Policy, budgets, audit and fuel are unimplemented, and known
-> sandbox gaps are open; do not run it on a machine or data you care about.
+> **Status: design spike, Nov 2025.** Budgets, guest limits and the host's rules are enforced; there
+> is no audit log yet, and known limits are open; do not run it on a machine or data you care about.
 > What works and what does not is listed under [Status](#status).
 
 Secure, local-first OS automation for LLMs: the design.
@@ -62,14 +62,14 @@ If you are fine with a hosted black box, you do not need this project.
    * Files: scoped to configured workspaces.
    * Processes: allowlisted commands.
    * Browser: controlled via WebDriver.
-   * Input: optional and off by default (not implemented yet).
+   * Input: optional and off by default (no backend ships; every call is refused).
 
 4. **LLM-agnostic control**
 
    * Any LLM that can speak JSON / tool-calls can drive `wasi-warden`.
    * Local models and cloud APIs both work via a single `llm` capability.
 
-5. **Audit, budgets, verification** (planned; see [Status](#status))
+5. **Audit, budgets, verification** (budgets enforced; audit and verification planned; see [Status](#status))
 
    * Every action is logged.
    * Per-task limits on steps, time, and scope.
@@ -121,18 +121,16 @@ A four-day spike (2025-11-11 to 2025-11-15). What exists:
 * A Rust guest (`agent-core`) built as a WASI Preview 2 component. It formats the prompt, calls the `llm`
   capability and parses the returned JSON plan; it calls no other capability itself.
 * A bounded loop: `hostd step` asks the planner for a plan, executes its actions natively (`hostd/src/actions.rs`)
-  and feeds the results back, for at most 8 rounds (`MAX_HOST_STEPS`).
+  and feeds the results back, within the run's budgets (`[budgets]`, below).
 
-What does not work yet:
+What does not work yet (the tests: 54 hostd and 7 agent-core unit tests, and 17 end-to-end tests that run
+the agent, a probe guest of the WIT capabilities and the browser against scripted fakes, in CI):
 
-* **Tests cover the host's own logic, not its security**: 33 unit tests (path resolution, the fs and proc
-  actions, configuration, the plan parser) and two end-to-end tests (a step against a scripted LLM, a browser
-  session against a fake WebDriver) run in CI. Three more tests record the security gaps below and are ignored
-  until they are fixed.
+* **No audit log yet**: capability calls are traced, but there is no structured log of every call with its
+  inputs and results.
 * **The planner's prompt lists only `fs.list_dir`, `fs.read_file` and `proc.spawn`**, though the host runs eleven
   actions, browser ones included; a model has to guess the rest.
-* **Nothing is enforced beyond the round cap**: no wasm fuel or epoch limit, no wall-clock or token budget, no
-  audit log. The `policy` capability and every `input` call return `Denied`.
+* **No input backend**: every `input` call is refused, and so is the browser's script evaluation.
 * **The sandbox isolates only prompt-building code**: the planning happens in the LLM and the actions run in the
   native host, outside the sandbox.
 * **The host's rules have known limits** (both the planner's actions and the WIT capabilities follow them):
@@ -211,7 +209,7 @@ cargo run -p hostd -- step --task "List workspace files" --observation '{}'
 
 `hostd step` loads `./target/wasm32-wasip2/release/agent_core.wasm` (`--component` to change it), asks the
 planner for a JSON plan, runs the allowed actions, and repeats with their results until the planner reports
-the task complete or 8 rounds pass. `hostd step --help` lists the flags.
+the task complete or a budget runs out (8 rounds by default). `hostd step --help` lists the flags.
 
 To try browser tasks, point the host at a running WebDriver (Chromedriver, Geckodriver, etc.) in `hostd.toml`:
 
@@ -265,10 +263,26 @@ The design's rules:
 * **Browser.** It visits only `allowed_hosts` over http(s): `goto` sends the URL as checked, and every later
   action first re-checks the page and abandons one that wandered off. Chrome keeps its sandbox unless
   `chrome_no_sandbox` is set, and downloads, when allowed, land in the workspace.
-* **Rounds.** The loop stops after 8 rounds (`MAX_HOST_STEPS`).
+* **Budgets** (`[budgets]` in hostd.toml), shared by both executors:
+  * `steps` (8): planner rounds.
+  * `wallclock_ms` (10 minutes): the whole run, process timeouts included; a guest still running at the end
+    is interrupted (wasmtime epochs).
+  * `llm_tokens` (200,000): tokens the endpoint reports; the call that crosses the limit is the last.
+  * `processes` (32), `filesystem_ops` (10,000) and `browser_actions` (200): one per operation, refused past
+    the limit.
+  * `guest_fuel` (10,000,000,000 per round; 0 for no limit): wasm work, so a guest that computes forever is
+    stopped.
+  * `guest_memory_bytes` (256 MiB): the agent's memory.
+* **Workspace rules** (`[workspace]`): `read_only` refuses every write through the fs capability, and
+  `max_file_bytes` (16 MiB) caps how large a write may make a file. Allowlisted programs run with the host's
+  permissions and are not bound by these.
+* **The policy capability** reports these rules and budgets to the guest and lets it spend its budgets and log
+  events (to the `audit` tracing target); no grant can widen the policy.
+* **The WIT browser interface** follows the same rules as the planner's browser actions; script evaluation is
+  refused, because a script could reach any host.
 
-**Not enforced yet:** fuel, wall-clock and token budgets, and an audit log. The limits listed under
-[Status](#status) apply. Whatever the planner reads, a
+**Not enforced yet:** an audit log of every capability call. The limits listed under [Status](#status)
+apply. Whatever the planner reads, a
 secrets file included, is sent to the configured LLM provider, so with a cloud model it leaves the machine.
 
 ---

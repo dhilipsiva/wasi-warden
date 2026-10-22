@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use serde::Deserialize;
 
+use crate::budget;
 use crate::cli::StepArgs;
 use crate::sandbox::{self, AllowedProgram};
 
@@ -23,6 +24,29 @@ pub struct HostConfig {
     pub child_path: OsString,
     pub llm: Option<LlmSettings>,
     pub browser: Option<BrowserSettings>,
+    /// The run's budgets (`[budgets]`).
+    pub budgets: budget::Limits,
+    /// The rules for the workspace (`[workspace]`).
+    pub workspace_rules: WorkspaceRules,
+}
+
+/// `[workspace]`: what the plan may do to the workspace.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceRules {
+    /// Refuse every write: creating, writing, truncating, renaming and removing.
+    pub read_only: bool,
+    /// The largest a file may be made by a write (and the most one read returns, with the host's
+    /// own cap).
+    pub max_file_bytes: u64,
+}
+
+impl Default for WorkspaceRules {
+    fn default() -> Self {
+        Self {
+            read_only: false,
+            max_file_bytes: 16 << 20,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +59,8 @@ pub struct LlmSettings {
 #[derive(Debug, Clone)]
 pub struct BrowserSettings {
     pub webdriver_url: String,
+    /// Read and ignored: profiles are not implemented, and every session starts fresh.
+    #[allow(dead_code)]
     pub default_profile: Option<String>,
     /// The hosts the browser may visit (`*.example.com` for subdomains). Empty allows nothing.
     pub allowed_hosts: Vec<String>,
@@ -84,6 +110,8 @@ impl HostConfig {
             child_path,
             llm,
             browser,
+            budgets: file_cfg.budgets.unwrap_or_default().into_limits(),
+            workspace_rules: file_cfg.workspace.unwrap_or_default().into_rules(),
         })
     }
 
@@ -100,6 +128,56 @@ struct FileConfig {
     allow_env: Option<Vec<String>>,
     llm: Option<LlmFileSettings>,
     browser: Option<BrowserFileSettings>,
+    budgets: Option<BudgetFileSettings>,
+    workspace: Option<WorkspaceFileSettings>,
+}
+
+/// `[budgets]`; each limit falls back to [`budget::Limits::default`].
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetFileSettings {
+    steps: Option<u64>,
+    wallclock_ms: Option<u64>,
+    llm_tokens: Option<u64>,
+    processes: Option<u64>,
+    filesystem_ops: Option<u64>,
+    browser_actions: Option<u64>,
+    guest_fuel: Option<u64>,
+    guest_memory_bytes: Option<u64>,
+}
+
+impl BudgetFileSettings {
+    fn into_limits(self) -> budget::Limits {
+        let d = budget::Limits::default();
+        budget::Limits {
+            steps: self.steps.unwrap_or(d.steps),
+            wallclock_ms: self.wallclock_ms.unwrap_or(d.wallclock_ms),
+            llm_tokens: self.llm_tokens.unwrap_or(d.llm_tokens),
+            processes: self.processes.unwrap_or(d.processes),
+            filesystem_ops: self.filesystem_ops.unwrap_or(d.filesystem_ops),
+            browser_actions: self.browser_actions.unwrap_or(d.browser_actions),
+            guest_fuel: self.guest_fuel.unwrap_or(d.guest_fuel),
+            guest_memory_bytes: self.guest_memory_bytes.unwrap_or(d.guest_memory_bytes),
+        }
+    }
+}
+
+/// `[workspace]`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceFileSettings {
+    read_only: Option<bool>,
+    max_file_bytes: Option<u64>,
+}
+
+impl WorkspaceFileSettings {
+    fn into_rules(self) -> WorkspaceRules {
+        let d = WorkspaceRules::default();
+        WorkspaceRules {
+            read_only: self.read_only.unwrap_or(d.read_only),
+            max_file_bytes: self.max_file_bytes.unwrap_or(d.max_file_bytes),
+        }
+    }
 }
 
 impl FileConfig {

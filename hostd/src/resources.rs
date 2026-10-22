@@ -25,3 +25,14 @@ pub struct ProcessResource {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
 }
+
+/// A browser session the guest opened through the WIT `browser` interface.
+pub struct BrowserSessionResource {
+    pub driver: thirtyfour::WebDriver,
+}
+
+/// An element the guest found, with the session it belongs to (whose page each action re-checks).
+pub struct BrowserElementResource {
+    pub element: thirtyfour::WebElement,
+    pub driver: thirtyfour::WebDriver,
+}

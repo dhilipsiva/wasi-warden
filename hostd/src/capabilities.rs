@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
@@ -11,8 +11,13 @@ use ureq::Agent;
 use wasmtime::component::{Resource, ResourceTableError};
 
 use crate::bindings;
+use crate::browser::{Browser, Select};
+use crate::budget::{self, Kind};
 use crate::config::{HostConfig, LlmSettings};
-use crate::resources::{DirHandleResource, FileHandleResource, ProcessResource};
+use crate::resources::{
+    BrowserElementResource, BrowserSessionResource, DirHandleResource, FileHandleResource,
+    ProcessResource,
+};
 use crate::sandbox;
 use crate::state::HostState;
 use bindings::osagent::llm::llm::Role as MessageRole;
@@ -300,6 +305,76 @@ fn confined_entry(
     sandbox::confine_entry(&state.config.workspace_root, parent, relative).map_err(path_error)
 }
 
+fn denied(why: impl Into<String>) -> CapabilityError {
+    capability_error(CapabilityErrorCode::Denied, why)
+}
+
+/// A browser failure: a refusal by the host's rules is `denied`, anything else `internal`.
+fn browser_error(err: anyhow::Error) -> CapabilityError {
+    let message = err.to_string();
+    let refused = [
+        "allowed hosts",
+        "allowed_hosts",
+        "only http and https",
+        "is not a URL",
+    ]
+    .iter()
+    .any(|m| message.contains(m));
+    let code = if refused {
+        CapabilityErrorCode::Denied
+    } else {
+        CapabilityErrorCode::Internal
+    };
+    capability_error(code, message)
+}
+
+impl HostState {
+    /// Pay for one `kind` operation from the run's budgets.
+    fn charge(&self, kind: Kind) -> Result<(), CapabilityError> {
+        budget::claim(&self.budgets, kind, 1)
+            .map(|_| ())
+            .map_err(denied)
+    }
+
+    /// Refuse a write when the workspace is read-only (`[workspace] read_only`).
+    fn writable(&self) -> Result<(), CapabilityError> {
+        if self.config.workspace_rules.read_only {
+            Err(denied("the workspace is read-only"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Refuse a call to the LLM once the token budget is spent.
+    fn tokens_left(&self) -> Result<(), CapabilityError> {
+        self.budgets
+            .lock()
+            .map_err(|_| denied("the budgets are unavailable"))?
+            .check(Kind::LlmTokens)
+            .map_err(|why| denied(format!("the token budget ran out: {why}")))
+    }
+
+    /// Record the tokens a call used.
+    fn spend_tokens(&self, usage: Option<&bindings::osagent::llm::llm::TokenUsage>) {
+        if let (Some(usage), Ok(mut budgets)) = (usage, self.budgets.lock()) {
+            budgets.spend(Kind::LlmTokens, u64::from(usage.total_tokens));
+        }
+    }
+
+    fn browser(&self) -> Result<Browser<'_>, CapabilityError> {
+        let settings = self
+            .config
+            .browser
+            .as_ref()
+            .ok_or_else(|| denied("browser capability is disabled in host configuration"))?;
+        Ok(Browser {
+            tokio: &self.tokio,
+            settings,
+            workspace: &self.config.workspace_root,
+        })
+    }
+}
+
 fn dir_path<'a>(
     state: &'a HostState,
     handle: &Resource<DirHandle>,
@@ -419,7 +494,25 @@ fn write_file_bytes(
     data: &[u8],
     op: &str,
 ) -> Result<u64, CapabilityError> {
+    state.writable()?;
+    let max = state.config.workspace_rules.max_file_bytes;
     let entry = file_entry_mut(state, handle)?;
+    // Wherever the write lands (the cursor, or the end when appending), the file ends no later than
+    // this.
+    let pos = entry
+        .file
+        .stream_position()
+        .map_err(|err| io_error(op, err))?;
+    let len = entry
+        .file
+        .metadata()
+        .map(|m| m.len())
+        .map_err(|err| io_error(op, err))?;
+    if pos.max(len).saturating_add(data.len() as u64) > max {
+        return Err(denied(format!(
+            "the write would make the file larger than max_file_bytes ({max})"
+        )));
+    }
     entry
         .file
         .write(data)
@@ -457,6 +550,7 @@ impl bindings::osagent::common::types::Host for HostState {}
 
 impl bindings::osagent::fs::fs::Host for HostState {
     fn open_workspace(&mut self) -> Result<Resource<DirHandle>, CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         insert_dir(self, self.config.workspace_root.clone())
     }
 
@@ -465,6 +559,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
         parent: Resource<DirHandle>,
         relative_path: String,
     ) -> Result<Resource<DirHandle>, CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         let parent_path = dir_path_buf(self, &parent)?;
         let candidate = confined(self, &parent_path, &relative_path)?;
         let metadata =
@@ -483,6 +578,8 @@ impl bindings::osagent::fs::fs::Host for HostState {
         parent: Resource<DirHandle>,
         relative_path: String,
     ) -> Result<Resource<DirHandle>, CapabilityError> {
+        self.writable()?;
+        self.charge(Kind::FilesystemOps)?;
         let parent_path = dir_path_buf(self, &parent)?;
         let candidate = confined(self, &parent_path, &relative_path)?;
         fs::create_dir_all(candidate.as_std_path())
@@ -496,6 +593,8 @@ impl bindings::osagent::fs::fs::Host for HostState {
         relative_path: String,
         recursive: bool,
     ) -> Result<(), CapabilityError> {
+        self.writable()?;
+        self.charge(Kind::FilesystemOps)?;
         let parent_path = dir_path_buf(self, &parent)?;
         let target = confined_entry(self, &parent_path, &relative_path)?;
         if recursive {
@@ -510,6 +609,8 @@ impl bindings::osagent::fs::fs::Host for HostState {
         parent: Resource<DirHandle>,
         relative_path: String,
     ) -> Result<(), CapabilityError> {
+        self.writable()?;
+        self.charge(Kind::FilesystemOps)?;
         let parent_path = dir_path_buf(self, &parent)?;
         let target = confined_entry(self, &parent_path, &relative_path)?;
         fs::remove_file(target.as_std_path()).map_err(|err| io_error("fs.remove-file", err))
@@ -521,6 +622,8 @@ impl bindings::osagent::fs::fs::Host for HostState {
         old_path: String,
         new_path: String,
     ) -> Result<(), CapabilityError> {
+        self.writable()?;
+        self.charge(Kind::FilesystemOps)?;
         let parent_path = dir_path_buf(self, &parent)?;
         let from = confined_entry(self, &parent_path, &old_path)?;
         let to = confined_entry(self, &parent_path, &new_path)?;
@@ -531,6 +634,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
         &mut self,
         target: Resource<DirHandle>,
     ) -> Result<Vec<bindings::osagent::fs::fs::DirEntry>, CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         // Re-checked on every use: the handle's entry may have been swapped for a symlink since it
         // was opened.
         let dir_path = dir_path(self, &target)?.to_path_buf();
@@ -556,6 +660,7 @@ impl bindings::osagent::fs::fs::Host for HostState {
         parent: Resource<DirHandle>,
         relative_path: Option<String>,
     ) -> Result<bindings::osagent::fs::fs::EntryMetadata, CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         let base = dir_path(self, &parent)?.to_path_buf();
         // With no relative path, the handle's own path, re-checked (it may have been swapped).
         let path = confined(self, &base, relative_path.as_deref().unwrap_or(""))?;
@@ -579,6 +684,10 @@ impl bindings::osagent::fs::fs::Host for HostState {
         relative_path: String,
         options: bindings::osagent::fs::fs::FileOpenOptions,
     ) -> Result<Resource<FileHandle>, CapabilityError> {
+        if options.write || options.append || options.create || options.truncate {
+            self.writable()?;
+        }
+        self.charge(Kind::FilesystemOps)?;
         let parent_path = dir_path_buf(self, &parent)?;
         let file_path = confined(self, &parent_path, &relative_path)?;
         let mut open_opts = OpenOptions::new();
@@ -617,6 +726,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
         handle: Resource<FileHandle>,
         max_bytes: u64,
     ) -> Result<Vec<u8>, CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         read_file_bytes(self, &handle, max_bytes, "fs.file.read")
     }
 
@@ -625,6 +735,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
         handle: Resource<FileHandle>,
         max_bytes: u64,
     ) -> Result<String, CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         let bytes = read_file_bytes(self, &handle, max_bytes, "fs.file.read-to-string")?;
         String::from_utf8(bytes).map_err(|_| {
             capability_error(
@@ -639,6 +750,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
         handle: Resource<FileHandle>,
         bytes: Vec<u8>,
     ) -> Result<u64, CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         write_file_bytes(self, &handle, &bytes, "fs.file.write")
     }
 
@@ -648,6 +760,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
         contents: String,
         newline: bool,
     ) -> Result<u64, CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         let mut data = contents.into_bytes();
         if newline {
             data.push(b'\n');
@@ -660,6 +773,14 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
         handle: Resource<FileHandle>,
         new_len: u64,
     ) -> Result<(), CapabilityError> {
+        self.writable()?;
+        self.charge(Kind::FilesystemOps)?;
+        let max = self.config.workspace_rules.max_file_bytes;
+        if new_len > max {
+            return Err(denied(format!(
+                "the file would be larger than max_file_bytes ({max})"
+            )));
+        }
         let file = file_entry_mut(self, &handle)?;
         file.file
             .set_len(new_len)
@@ -667,6 +788,7 @@ impl bindings::osagent::fs::fs::HostFileHandle for HostState {
     }
 
     fn flush(&mut self, handle: Resource<FileHandle>) -> Result<(), CapabilityError> {
+        self.charge(Kind::FilesystemOps)?;
         let file = file_entry_mut(self, &handle)?;
         file.file
             .flush()
@@ -693,6 +815,7 @@ impl bindings::osagent::proc::proc::Host for HostState {
         command: String,
         options: bindings::osagent::proc::proc::SpawnOptions,
     ) -> Result<Resource<ProcHandle>, CapabilityError> {
+        self.charge(Kind::Processes)?;
         let Some(program) = self.config.program_for(&command).map(Path::to_path_buf) else {
             return Err(capability_error(
                 CapabilityErrorCode::Denied,
@@ -753,8 +876,15 @@ impl bindings::osagent::proc::proc::Host for HostState {
         }
 
         // Runs to completion here (bounded in time and output); the handle then serves its results.
-        let output = sandbox::run_bounded(cmd, sandbox::proc_timeout(options.timeout_ms))
-            .map_err(|err| io_error("proc.spawn", err))?;
+        // Never past the run's wall-clock budget.
+        let remaining = self
+            .budgets
+            .lock()
+            .map(|b| b.remaining_wallclock())
+            .unwrap_or_default();
+        let timeout = sandbox::proc_timeout(options.timeout_ms).min(remaining);
+        let output =
+            sandbox::run_bounded(cmd, timeout).map_err(|err| io_error("proc.spawn", err))?;
         let resource = ProcessResource {
             command: command.clone(),
             stdout: output.stdout,
@@ -784,7 +914,7 @@ impl bindings::osagent::proc::proc::HostProcess for HostState {
     ) -> Result<u32, CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
-            "process capability is not implemented",
+            "stdin is closed: proc.spawn runs a process to completion with stdin null",
         ))
     }
 
@@ -851,166 +981,243 @@ impl bindings::osagent::proc::proc::HostProcess for HostState {
     }
 }
 
+type Session = bindings::osagent::browser::browser::Session;
+type ElementHandle = bindings::osagent::browser::browser::ElementHandle;
+
+fn select(selector: bindings::osagent::browser::browser::Selector) -> Select {
+    use bindings::osagent::browser::browser::SelectorKind;
+    match selector.kind {
+        SelectorKind::Css => Select::Css(selector.value),
+        SelectorKind::Xpath => Select::XPath(selector.value),
+        SelectorKind::Text => Select::Text(selector.value),
+    }
+}
+
+fn wait_for(timeout_ms: Option<u64>) -> std::time::Duration {
+    Duration::from_millis(timeout_ms.unwrap_or(5_000))
+}
+
+impl HostState {
+    fn session_driver(
+        &self,
+        session: &Resource<Session>,
+    ) -> Result<thirtyfour::WebDriver, CapabilityError> {
+        self.resources
+            .get(session)
+            .map(|s: &BrowserSessionResource| s.driver.clone())
+            .map_err(table_error)
+    }
+
+    fn element_parts(
+        &self,
+        element: &Resource<ElementHandle>,
+    ) -> Result<(thirtyfour::WebDriver, thirtyfour::WebElement), CapabilityError> {
+        self.resources
+            .get(element)
+            .map(|e: &BrowserElementResource| (e.driver.clone(), e.element.clone()))
+            .map_err(table_error)
+    }
+
+    fn insert_element(
+        &mut self,
+        driver: thirtyfour::WebDriver,
+        element: thirtyfour::WebElement,
+    ) -> Result<Resource<ElementHandle>, CapabilityError> {
+        self.resources
+            .push(BrowserElementResource { element, driver })
+            .map_err(table_error)
+    }
+}
+
 impl bindings::osagent::browser::browser::Host for HostState {
     fn open_session(
         &mut self,
-        _options: bindings::osagent::browser::browser::SessionOptions,
-    ) -> Result<Resource<bindings::osagent::browser::browser::Session>, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+        options: bindings::osagent::browser::browser::SessionOptions,
+    ) -> Result<Resource<Session>, CapabilityError> {
+        self.charge(Kind::BrowserActions)?;
+        let driver = self
+            .browser()?
+            .open(options.headless, options.allow_downloads)
+            .map_err(browser_error)?;
+        self.resources
+            .push(BrowserSessionResource { driver })
+            .map_err(table_error)
     }
 }
 
 impl bindings::osagent::browser::browser::HostSession for HostState {
-    fn close(&mut self, _rep: Resource<bindings::osagent::browser::browser::Session>) {}
+    /// Ends the browser session; the entry goes when the guest drops the handle.
+    fn close(&mut self, session: Resource<Session>) {
+        if let (Ok(driver), Ok(browser)) = (self.session_driver(&session), self.browser()) {
+            browser.quit(driver);
+        }
+    }
 
-    fn drop(
-        &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::Session>,
-    ) -> wasmtime::Result<()> {
+    fn drop(&mut self, session: Resource<Session>) -> wasmtime::Result<()> {
+        if let Ok(entry) = self.resources.delete(session)
+            && let Ok(browser) = self.browser()
+        {
+            browser.quit(entry.driver);
+        }
         Ok(())
     }
 
     fn goto(
         &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::Session>,
-        _url: String,
-        _timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
+        session: Resource<Session>,
+        url: String,
+        timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
     ) -> Result<bindings::osagent::browser::browser::PageState, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+        self.charge(Kind::BrowserActions)?;
+        let driver = self.session_driver(&session)?;
+        let landed = self
+            .browser()?
+            .goto(&driver, &url, wait_for(timeout_ms))
+            .map_err(browser_error)?;
+        Ok(bindings::osagent::browser::browser::PageState {
+            url: landed,
+            title: None,
+            html: None,
+        })
     }
 
     fn describe_page(
         &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::Session>,
-        _include_html: bool,
+        session: Resource<Session>,
+        include_html: bool,
     ) -> Result<bindings::osagent::browser::browser::PageState, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+        self.charge(Kind::BrowserActions)?;
+        let driver = self.session_driver(&session)?;
+        let page = self
+            .browser()?
+            .describe(&driver, include_html)
+            .map_err(browser_error)?;
+        Ok(bindings::osagent::browser::browser::PageState {
+            url: page.url,
+            title: page.title,
+            html: page.html,
+        })
     }
 
+    /// Always a PNG (the WebDriver protocol offers no other format); `mime-type` says so.
     fn screenshot(
         &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::Session>,
+        session: Resource<Session>,
         _kind: bindings::osagent::browser::browser::ScreenshotKind,
     ) -> Result<bindings::osagent::browser::browser::Screenshot, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+        self.charge(Kind::BrowserActions)?;
+        let driver = self.session_driver(&session)?;
+        let data = self.browser()?.screenshot(&driver).map_err(browser_error)?;
+        Ok(bindings::osagent::browser::browser::Screenshot {
+            mime_type: "image/png".to_string(),
+            data,
+        })
     }
 
+    /// Refused: a script could reach any host from the page, around `allowed_hosts`.
     fn eval(
         &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::Session>,
+        _session: Resource<Session>,
         _expression: String,
     ) -> Result<bindings::osagent::common::types::Json, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
+        Err(denied(
+            "script evaluation is disabled: a script could reach any host and bypass allowed_hosts",
         ))
     }
 
     fn find(
         &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::Session>,
-        _selector: bindings::osagent::browser::browser::Selector,
-        _timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
-    ) -> Result<Resource<bindings::osagent::browser::browser::ElementHandle>, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+        session: Resource<Session>,
+        selector: bindings::osagent::browser::browser::Selector,
+        timeout_ms: Option<bindings::osagent::common::types::Milliseconds>,
+    ) -> Result<Resource<ElementHandle>, CapabilityError> {
+        self.charge(Kind::BrowserActions)?;
+        let driver = self.session_driver(&session)?;
+        let element = self
+            .browser()?
+            .find(&driver, &select(selector), wait_for(timeout_ms))
+            .map_err(browser_error)?;
+        self.insert_element(driver, element)
     }
 
     fn query_all(
         &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::Session>,
-        _selector: bindings::osagent::browser::browser::Selector,
-    ) -> Result<Vec<Resource<bindings::osagent::browser::browser::ElementHandle>>, CapabilityError>
-    {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+        session: Resource<Session>,
+        selector: bindings::osagent::browser::browser::Selector,
+    ) -> Result<Vec<Resource<ElementHandle>>, CapabilityError> {
+        self.charge(Kind::BrowserActions)?;
+        let driver = self.session_driver(&session)?;
+        let elements = self
+            .browser()?
+            .find_all(&driver, &select(selector))
+            .map_err(browser_error)?;
+        elements
+            .into_iter()
+            .map(|element| self.insert_element(driver.clone(), element))
+            .collect()
     }
 }
 
 impl bindings::osagent::browser::browser::HostElementHandle for HostState {
-    fn click(
-        &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-    ) -> Result<(), CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+    fn click(&mut self, element: Resource<ElementHandle>) -> Result<(), CapabilityError> {
+        self.charge(Kind::BrowserActions)?;
+        let (driver, element) = self.element_parts(&element)?;
+        self.browser()?
+            .click(&driver, &element)
+            .map_err(browser_error)
     }
 
     fn type_text(
         &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-        _text: String,
-        _submit: bool,
+        element: Resource<ElementHandle>,
+        text: String,
+        submit: bool,
     ) -> Result<(), CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+        self.charge(Kind::BrowserActions)?;
+        let (driver, element) = self.element_parts(&element)?;
+        self.browser()?
+            .type_text(&driver, &element, &text, submit)
+            .map_err(browser_error)
     }
 
-    fn clear(
-        &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-    ) -> Result<(), CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+    fn clear(&mut self, element: Resource<ElementHandle>) -> Result<(), CapabilityError> {
+        self.charge(Kind::BrowserActions)?;
+        let (driver, element) = self.element_parts(&element)?;
+        self.browser()?
+            .clear(&driver, &element)
+            .map_err(browser_error)
     }
 
     fn attribute(
         &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-        _name: String,
+        element: Resource<ElementHandle>,
+        name: String,
     ) -> Result<Option<String>, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+        self.charge(Kind::BrowserActions)?;
+        let (driver, element) = self.element_parts(&element)?;
+        self.browser()?
+            .attribute(&driver, &element, &name)
+            .map_err(browser_error)
     }
 
-    fn inner_text(
-        &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-    ) -> Result<String, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+    fn inner_text(&mut self, element: Resource<ElementHandle>) -> Result<String, CapabilityError> {
+        self.charge(Kind::BrowserActions)?;
+        let (driver, element) = self.element_parts(&element)?;
+        self.browser()?
+            .inner_text(&driver, &element)
+            .map_err(browser_error)
     }
 
-    fn html(
-        &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-    ) -> Result<String, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "browser capability is not implemented",
-        ))
+    fn html(&mut self, element: Resource<ElementHandle>) -> Result<String, CapabilityError> {
+        self.charge(Kind::BrowserActions)?;
+        let (driver, element) = self.element_parts(&element)?;
+        self.browser()?
+            .outer_html(&driver, &element)
+            .map_err(browser_error)
     }
 
-    fn drop(
-        &mut self,
-        _rep: Resource<bindings::osagent::browser::browser::ElementHandle>,
-    ) -> wasmtime::Result<()> {
+    fn drop(&mut self, element: Resource<ElementHandle>) -> wasmtime::Result<()> {
+        let _ = self.resources.delete(element);
         Ok(())
     }
 }
@@ -1019,7 +1226,7 @@ impl bindings::osagent::input::input::Host for HostState {
     fn key_sequence(&mut self, _text: String) -> Result<(), CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
-            "input capability is not implemented",
+            "input is disabled: wasi-warden ships no keyboard or mouse backend",
         ))
     }
 
@@ -1029,7 +1236,7 @@ impl bindings::osagent::input::input::Host for HostState {
     ) -> Result<(), CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
-            "input capability is not implemented",
+            "input is disabled: wasi-warden ships no keyboard or mouse backend",
         ))
     }
 
@@ -1039,7 +1246,7 @@ impl bindings::osagent::input::input::Host for HostState {
     ) -> Result<(), CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
-            "input capability is not implemented",
+            "input is disabled: wasi-warden ships no keyboard or mouse backend",
         ))
     }
 
@@ -1050,7 +1257,7 @@ impl bindings::osagent::input::input::Host for HostState {
     ) -> Result<(), CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
-            "input capability is not implemented",
+            "input is disabled: wasi-warden ships no keyboard or mouse backend",
         ))
     }
 
@@ -1060,7 +1267,7 @@ impl bindings::osagent::input::input::Host for HostState {
     ) -> Result<(), CapabilityError> {
         Err(capability_error(
             CapabilityErrorCode::Denied,
-            "input capability is not implemented",
+            "input is disabled: wasi-warden ships no keyboard or mouse backend",
         ))
     }
 }
@@ -1071,10 +1278,12 @@ impl bindings::osagent::llm::llm::Host for HostState {
         messages: Vec<bindings::osagent::llm::llm::Message>,
         options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::CompletionResponse, CapabilityError> {
+        self.tokens_left()?;
         let settings = require_llm_settings(&self.config)?;
         let request = build_chat_request(&settings.model, messages, options, None);
         let response = execute_chat_request(settings, &request)?;
         let usage = convert_usage(response.usage);
+        self.spend_tokens(usage.as_ref());
         let mut choices = response.choices.into_iter();
         let choice = choices.next().ok_or_else(|| {
             capability_error(
@@ -1101,11 +1310,13 @@ impl bindings::osagent::llm::llm::Host for HostState {
         tools: Vec<bindings::osagent::llm::llm::ToolSchema>,
         options: bindings::osagent::llm::llm::Options,
     ) -> Result<bindings::osagent::llm::llm::ToolResponse, CapabilityError> {
+        self.tokens_left()?;
         let settings = require_llm_settings(&self.config)?;
         let chat_tools = tools_to_chat(tools)?;
         let request = build_chat_request(&settings.model, messages, options, Some(chat_tools));
         let response = execute_chat_request(settings, &request)?;
         let usage = convert_usage(response.usage);
+        self.spend_tokens(usage.as_ref());
         let mut choices = response.choices.into_iter();
         let choice = choices.next().ok_or_else(|| {
             capability_error(
@@ -1133,44 +1344,115 @@ impl bindings::osagent::llm::llm::Host for HostState {
     }
 }
 
+fn kind_of(kind: bindings::osagent::policy::policy::BudgetKind) -> Kind {
+    use bindings::osagent::policy::policy::BudgetKind;
+    match kind {
+        BudgetKind::Steps => Kind::Steps,
+        BudgetKind::WallclockMs => Kind::WallclockMs,
+        BudgetKind::LlmTokens => Kind::LlmTokens,
+        BudgetKind::Processes => Kind::Processes,
+        BudgetKind::FilesystemOps => Kind::FilesystemOps,
+        BudgetKind::BrowserActions => Kind::BrowserActions,
+    }
+}
+
+fn wit_kind(kind: Kind) -> bindings::osagent::policy::policy::BudgetKind {
+    use bindings::osagent::policy::policy::BudgetKind;
+    match kind {
+        Kind::Steps => BudgetKind::Steps,
+        Kind::WallclockMs => BudgetKind::WallclockMs,
+        Kind::LlmTokens => BudgetKind::LlmTokens,
+        Kind::Processes => BudgetKind::Processes,
+        Kind::FilesystemOps => BudgetKind::FilesystemOps,
+        Kind::BrowserActions => BudgetKind::BrowserActions,
+    }
+}
+
+impl HostState {
+    fn budget_snapshot(&self, kind: Kind) -> bindings::osagent::policy::policy::BudgetSnapshot {
+        let (limit, used) = self
+            .budgets
+            .lock()
+            .map(|b| (b.limits().of(kind), b.used(kind)))
+            .unwrap_or_default();
+        bindings::osagent::policy::policy::BudgetSnapshot {
+            kind: wit_kind(kind),
+            limit: Some(limit),
+            used,
+        }
+    }
+}
+
+/// The policy as hostd.toml set it. It is fixed for the run: the guest can read it, spend its
+/// budgets and log events, but no grant widens it.
 impl bindings::osagent::policy::policy::Host for HostState {
     fn describe(
         &mut self,
     ) -> Result<bindings::osagent::policy::policy::PolicySnapshot, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "policy capability is not implemented",
-        ))
+        use bindings::osagent::policy::policy as wit;
+        let rules = self.config.workspace_rules;
+        Ok(wit::PolicySnapshot {
+            workspaces: vec![wit::WorkspaceRule {
+                label: "workspace".to_string(),
+                relative_root: ".".to_string(),
+                read_only: rules.read_only,
+                max_file_bytes: Some(rules.max_file_bytes),
+            }],
+            commands: self
+                .config
+                .allowed_proc_commands
+                .iter()
+                .map(|name| wit::CommandRule {
+                    name: name.clone(),
+                    description: None,
+                })
+                .collect(),
+            browser: self.config.browser.as_ref().map(|b| wit::BrowserRule {
+                allowed_hosts: b.allowed_hosts.clone(),
+                allow_screenshots: true,
+                allow_file_uploads: false,
+            }),
+            budgets: Kind::ALL.iter().map(|k| self.budget_snapshot(*k)).collect(),
+        })
     }
 
     fn claim_budget(
         &mut self,
-        _kind: bindings::osagent::policy::policy::BudgetKind,
-        _units: u64,
+        kind: bindings::osagent::policy::policy::BudgetKind,
+        units: u64,
     ) -> Result<bindings::osagent::policy::policy::BudgetSnapshot, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "policy capability is not implemented",
-        ))
+        let kind = kind_of(kind);
+        budget::claim(&self.budgets, kind, units).map_err(denied)?;
+        Ok(self.budget_snapshot(kind))
     }
 
     fn request_capability(
         &mut self,
-        _request: bindings::osagent::policy::policy::GrantRequest,
+        request: bindings::osagent::policy::policy::GrantRequest,
     ) -> Result<bindings::osagent::policy::policy::GrantResponse, CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "policy capability is not implemented",
-        ))
+        tracing::info!(
+            target: "audit",
+            capability = request.capability,
+            scope = request.scope,
+            "grant requested and refused: the policy is fixed by hostd.toml"
+        );
+        Ok(bindings::osagent::policy::policy::GrantResponse {
+            approved: false,
+            reason: Some("no grants are configured: the policy is fixed by hostd.toml".to_string()),
+        })
     }
 
     fn log_event(
         &mut self,
-        _event: bindings::osagent::common::types::AuditEvent,
+        event: bindings::osagent::common::types::AuditEvent,
     ) -> Result<(), CapabilityError> {
-        Err(capability_error(
-            CapabilityErrorCode::Denied,
-            "policy capability is not implemented",
-        ))
+        tracing::info!(
+            target: "audit",
+            event_type = event.event_type,
+            step = event.step,
+            payload = event.payload,
+            "agent event"
+        );
+        Ok(())
     }
 }

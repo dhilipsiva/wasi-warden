@@ -13,7 +13,9 @@ use thirtyfour::prelude::*;
 use tokio::runtime::Handle;
 
 use crate::bindings::exports::osagent::agent::planner::PlannedAction;
-use crate::config::{BrowserSettings, HostConfig};
+use crate::browser::{Browser, Select};
+use crate::budget::{self, Kind};
+use crate::config::HostConfig;
 use crate::sandbox;
 
 #[derive(Debug, Serialize)]
@@ -49,14 +51,9 @@ impl ActionReport {
 pub struct ActionExecutor {
     config: HostConfig,
     tokio: Handle,
-    browser_sessions: HashMap<String, BrowserSessionEntry>,
+    budgets: budget::Shared,
+    browser_sessions: HashMap<String, WebDriver>,
     browser_elements: HashMap<String, BrowserElementEntry>,
-}
-
-struct BrowserSessionEntry {
-    driver: WebDriver,
-    #[allow(dead_code)]
-    profile: Option<String>,
 }
 
 struct BrowserElementEntry {
@@ -65,10 +62,11 @@ struct BrowserElementEntry {
 }
 
 impl ActionExecutor {
-    pub fn new(config: HostConfig, tokio: Handle) -> Self {
+    pub fn new(config: HostConfig, tokio: Handle, budgets: budget::Shared) -> Self {
         Self {
             config,
             tokio,
+            budgets,
             browser_sessions: HashMap::new(),
             browser_elements: HashMap::new(),
         }
@@ -94,6 +92,22 @@ impl ActionExecutor {
         let input: Value = serde_json::from_str(&action.input).with_context(|| {
             format!("capability `{}` input is not valid JSON", action.capability)
         })?;
+        // Every action is paid for from its family's budget before it runs, and none runs past the
+        // wall-clock budget.
+        self.budgets
+            .lock()
+            .map_err(|_| anyhow!("the budgets are unavailable"))?
+            .check(Kind::WallclockMs)
+            .map_err(anyhow::Error::msg)?;
+        let family = match action.capability.split('.').next() {
+            Some("fs") => Some(Kind::FilesystemOps),
+            Some("proc") => Some(Kind::Processes),
+            Some("browser") => Some(Kind::BrowserActions),
+            _ => None,
+        };
+        if let Some(kind) = family {
+            budget::claim(&self.budgets, kind, 1).map_err(anyhow::Error::msg)?;
+        }
         match action.capability.as_str() {
             "fs.list_dir" => {
                 let params: FsListDirInput = serde_json::from_value(input)?;
@@ -241,7 +255,14 @@ impl ActionExecutor {
             }
         }
 
-        let output = sandbox::run_bounded(cmd, sandbox::proc_timeout(params.timeout_ms))
+        // Never past the run's wall-clock budget.
+        let remaining = self
+            .budgets
+            .lock()
+            .map(|b| b.remaining_wallclock())
+            .unwrap_or_default();
+        let timeout = sandbox::proc_timeout(params.timeout_ms).min(remaining);
+        let output = sandbox::run_bounded(cmd, timeout)
             .with_context(|| format!("failed to execute {}", params.command))?;
         Ok(json!({
             "command": params.command,
@@ -256,99 +277,51 @@ impl ActionExecutor {
         }))
     }
 
+    fn browser(&self) -> Result<Browser<'_>> {
+        let settings = self
+            .config
+            .browser
+            .as_ref()
+            .ok_or_else(|| anyhow!("browser capability is disabled in host configuration"))?;
+        Ok(Browser {
+            tokio: &self.tokio,
+            settings,
+            workspace: &self.config.workspace_root,
+        })
+    }
+
     fn browser_open_session(&mut self, params: BrowserOpenSessionInput) -> Result<Value> {
-        let settings = self.browser_settings()?;
         let alias = normalized_alias(&params.alias)?;
         if self.browser_sessions.contains_key(&alias) {
             bail!("browser session `{alias}` already exists");
         }
-        let webdriver_url = settings.webdriver_url.clone();
-        let headless = params.headless.unwrap_or(true);
-        let profile = params.profile.or_else(|| settings.default_profile.clone());
-        let allow_downloads = params.allow_downloads.unwrap_or(false);
-        let no_sandbox = settings.chrome_no_sandbox;
-        let download_dir = self.config.workspace_root.to_string();
-        let handle = self.tokio.clone();
-        let driver = handle.block_on(async move {
-            let mut caps = DesiredCapabilities::chrome();
-            if headless {
-                caps.add_arg("--headless=new")?;
-                caps.add_arg("--disable-gpu")?;
-            }
-            caps.add_arg("--disable-dev-shm-usage")?;
-            if no_sandbox {
-                caps.add_arg("--no-sandbox")?;
-            }
-            if allow_downloads {
-                // Into the workspace, not the user's Downloads folder.
-                let prefs = serde_json::json!({
-                    "download.prompt_for_download": false,
-                    "download.default_directory": download_dir,
-                });
-                caps.add_experimental_option("prefs", prefs)?;
-            }
-            WebDriver::new(&webdriver_url, caps).await
-        })?;
-
-        self.browser_sessions
-            .insert(alias.clone(), BrowserSessionEntry { driver, profile });
+        let driver = self.browser()?.open(
+            params.headless.unwrap_or(true),
+            params.allow_downloads.unwrap_or(false),
+        )?;
+        self.browser_sessions.insert(alias.clone(), driver);
         Ok(json!({ "session": alias }))
     }
 
     fn browser_session_goto(&self, params: BrowserGotoInput) -> Result<Value> {
         let alias = normalized_alias(&params.session)?;
         let driver = self.session_driver(&alias)?;
-        let allowed = &self.browser_settings()?.allowed_hosts;
-        // The URL as parsed is what the browser gets, so the check and the visit agree.
-        let url = sandbox::check_navigation(&params.url, allowed).map_err(anyhow::Error::msg)?;
-        let timeout = params.timeout_ms.unwrap_or(5_000);
-        self.tokio.block_on({
-            let driver = driver.clone();
-            async move {
-                driver.goto(&url).await?;
-                tokio::time::sleep(Duration::from_millis(timeout.min(30_000))).await;
-                Ok::<_, WebDriverError>(())
-            }
-        })?;
-        let current_url = self.tokio.block_on({
-            let driver = driver.clone();
-            async move { driver.current_url().await.map(|u| u.to_string()) }
-        })?;
-        // A page may redirect anywhere; one that left the allowed hosts is abandoned.
-        if let Err(why) = sandbox::check_navigation(&current_url, allowed) {
-            self.tokio.block_on({
-                let driver = driver.clone();
-                async move { driver.goto("about:blank").await }
-            })?;
-            bail!("the page redirected off the allowed hosts ({why}); left for about:blank");
-        }
-        Ok(json!({
-            "session": alias,
-            "url": current_url,
-        }))
+        let settle = Duration::from_millis(params.timeout_ms.unwrap_or(5_000));
+        let url = self.browser()?.goto(&driver, &params.url, settle)?;
+        Ok(json!({ "session": alias, "url": url }))
     }
 
     fn browser_session_describe(&self, params: BrowserDescribeInput) -> Result<Value> {
         let alias = normalized_alias(&params.session)?;
-        let include_html = params.include_html.unwrap_or(false);
-        let driver = self.checked_driver(&alias)?;
-        let driver_for_meta = driver.clone();
-        let (url, title) = self.tokio.block_on(async move {
-            let url = driver_for_meta.current_url().await?.to_string();
-            let title = driver_for_meta.title().await.ok();
-            Ok::<_, WebDriverError>((url, title))
-        })?;
-        let html = if include_html {
-            let driver = driver.clone();
-            Some(self.tokio.block_on(async move { driver.source().await })?)
-        } else {
-            None
-        };
+        let driver = self.session_driver(&alias)?;
+        let page = self
+            .browser()?
+            .describe(&driver, params.include_html.unwrap_or(false))?;
         Ok(json!({
             "session": alias,
-            "url": url,
-            "title": title,
-            "html": html,
+            "url": page.url,
+            "title": page.title,
+            "html": page.html,
         }))
     }
 
@@ -358,14 +331,14 @@ impl ActionExecutor {
         if self.browser_elements.contains_key(&element_alias) {
             bail!("browser element `{element_alias}` already exists");
         }
-        let driver = self.checked_driver(&session_alias)?;
-        let selector = selector_to_by(&params.selector)?;
-        let timeout = params.timeout_ms.unwrap_or(5_000);
-        let element = self.tokio.block_on(async move {
-            let mut query = driver.query(selector);
-            query = query.wait(Duration::from_millis(timeout), Duration::from_millis(200));
-            query.first().await
-        })?;
+        let driver = self.session_driver(&session_alias)?;
+        let select = match params.selector.kind {
+            BrowserSelectorKind::Css => Select::Css(params.selector.value),
+            BrowserSelectorKind::XPath => Select::XPath(params.selector.value),
+            BrowserSelectorKind::Text => Select::Text(params.selector.value),
+        };
+        let wait = Duration::from_millis(params.timeout_ms.unwrap_or(5_000));
+        let element = self.browser()?.find(&driver, &select, wait)?;
         self.browser_elements.insert(
             element_alias.clone(),
             BrowserElementEntry {
@@ -373,95 +346,41 @@ impl ActionExecutor {
                 session: session_alias.clone(),
             },
         );
-        Ok(json!({
-            "session": session_alias,
-            "element": element_alias,
-        }))
+        Ok(json!({ "session": session_alias, "element": element_alias }))
     }
 
     fn browser_element_click(&self, params: BrowserElementActionInput) -> Result<Value> {
         let element_alias = normalized_alias(&params.element)?;
-        let element = self.checked_element(&element_alias)?;
-        self.tokio.block_on(async move { element.click().await })?;
+        let (driver, element) = self.element(&element_alias)?;
+        self.browser()?.click(&driver, &element)?;
         Ok(json!({ "element": element_alias }))
     }
 
     fn browser_element_type(&self, params: BrowserElementTypeInput) -> Result<Value> {
         let element_alias = normalized_alias(&params.element)?;
-        let element = self.checked_element(&element_alias)?;
+        let (driver, element) = self.element(&element_alias)?;
         let text = params.text.unwrap_or_default();
-        self.tokio
-            .block_on(async move { element.send_keys(text).await })?;
-        if params.submit.unwrap_or(false) {
-            let element = self.element_handle(&element_alias)?;
-            self.tokio
-                .block_on(async move { element.send_keys(Key::Enter).await })?;
-        }
+        self.browser()?
+            .type_text(&driver, &element, &text, params.submit.unwrap_or(false))?;
         Ok(json!({ "element": element_alias }))
     }
 
     fn browser_element_inner_text(&self, params: BrowserElementActionInput) -> Result<Value> {
         let element_alias = normalized_alias(&params.element)?;
-        let element = self.checked_element(&element_alias)?;
-        let text = self.tokio.block_on(async move { element.text().await })?;
-        Ok(json!({
-            "element": element_alias,
-            "text": text,
-        }))
+        let (driver, element) = self.element(&element_alias)?;
+        let text = self.browser()?.inner_text(&driver, &element)?;
+        Ok(json!({ "element": element_alias, "text": text }))
     }
 
     fn browser_session_screenshot(&self, params: BrowserScreenshotInput) -> Result<Value> {
         let alias = normalized_alias(&params.session)?;
-        let driver = self.checked_driver(&alias)?;
-        let raw = self
-            .tokio
-            .block_on(async move { driver.screenshot_as_png().await })?;
-        let encoded = Base64.encode(raw);
+        let driver = self.session_driver(&alias)?;
+        let raw = self.browser()?.screenshot(&driver)?;
         Ok(json!({
             "session": alias,
             "kind": params.kind.unwrap_or(ScreenshotKind::Png),
-            "data_base64": encoded,
+            "data_base64": Base64.encode(raw),
         }))
-    }
-
-    /// The session's page must still be on the allowed hosts (or blank): a page can navigate itself
-    /// (a script, a meta refresh, a followed link) after `goto` checked it. A page that wandered off
-    /// is left for `about:blank` and the action refused.
-    fn ensure_allowed_page(&self, driver: &WebDriver) -> Result<()> {
-        let allowed = &self.browser_settings()?.allowed_hosts;
-        let current = self.tokio.block_on({
-            let driver = driver.clone();
-            async move { driver.current_url().await.map(|u| u.to_string()) }
-        })?;
-        if sandbox::is_blank_page(&current) {
-            return Ok(());
-        }
-        if let Err(why) = sandbox::check_navigation(&current, allowed) {
-            self.tokio.block_on({
-                let driver = driver.clone();
-                async move { driver.goto("about:blank").await }
-            })?;
-            bail!("the page left the allowed hosts ({why}); left for about:blank");
-        }
-        Ok(())
-    }
-
-    /// The driver of the session `alias`, after checking its page ([`Self::ensure_allowed_page`]).
-    fn checked_driver(&self, alias: &str) -> Result<WebDriver> {
-        let driver = self.session_driver(alias)?;
-        self.ensure_allowed_page(&driver)?;
-        Ok(driver)
-    }
-
-    /// The element `alias`, after checking its session's page ([`Self::ensure_allowed_page`]).
-    fn checked_element(&self, alias: &str) -> Result<WebElement> {
-        let session = self
-            .browser_elements
-            .get(alias)
-            .map(|entry| entry.session.clone())
-            .ok_or_else(|| anyhow!("unknown browser element `{alias}`"))?;
-        self.ensure_allowed_page(&self.session_driver(&session)?)?;
-        self.element_handle(alias)
     }
 
     /// `relative` under the workspace root ([`sandbox::confine`]).
@@ -470,36 +389,32 @@ impl ActionExecutor {
         Ok(sandbox::confine(root, root, relative)?)
     }
 
-    fn browser_settings(&self) -> Result<&BrowserSettings> {
-        self.config
-            .browser
-            .as_ref()
-            .ok_or_else(|| anyhow!("browser capability is disabled in host configuration"))
-    }
-
     fn session_driver(&self, alias: &str) -> Result<WebDriver> {
         self.browser_sessions
             .get(alias)
-            .map(|entry| entry.driver.clone())
+            .cloned()
             .ok_or_else(|| anyhow!("unknown browser session `{alias}`"))
     }
 
-    fn element_handle(&self, alias: &str) -> Result<WebElement> {
-        self.browser_elements
+    /// The element `alias` and the driver of its session (whose page each action re-checks).
+    fn element(&self, alias: &str) -> Result<(WebDriver, WebElement)> {
+        let entry = self
+            .browser_elements
             .get(alias)
-            .map(|entry| entry.element.clone())
-            .ok_or_else(|| anyhow!("unknown browser element `{alias}`"))
+            .ok_or_else(|| anyhow!("unknown browser element `{alias}`"))?;
+        Ok((self.session_driver(&entry.session)?, entry.element.clone()))
     }
 }
 
 impl Drop for ActionExecutor {
     fn drop(&mut self) {
-        let handle = self.tokio.clone();
-        for (_, entry) in self.browser_sessions.drain() {
-            let driver = entry.driver.clone();
-            let _ = handle.block_on(async move { driver.quit().await });
-        }
         self.browser_elements.clear();
+        let sessions = std::mem::take(&mut self.browser_sessions);
+        if let Ok(browser) = self.browser() {
+            for (_, driver) in sessions {
+                browser.quit(driver);
+            }
+        }
     }
 }
 
@@ -534,6 +449,8 @@ struct ProcEnvVar {
 #[derive(Deserialize)]
 struct BrowserOpenSessionInput {
     alias: String,
+    /// Accepted and ignored: profiles are not implemented, and every session starts fresh.
+    #[allow(dead_code)]
     profile: Option<String>,
     headless: Option<bool>,
     allow_downloads: Option<bool>,
@@ -606,18 +523,6 @@ fn normalized_alias(input: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-fn selector_to_by(selector: &BrowserSelector) -> Result<By> {
-    match selector.kind {
-        BrowserSelectorKind::Css => Ok(By::Css(selector.value.clone())),
-        BrowserSelectorKind::XPath => Ok(By::XPath(selector.value.clone())),
-        BrowserSelectorKind::Text => {
-            let text_literal = serde_json::to_string(&selector.value)?;
-            let xpath = format!("//*[normalize-space(text()) = {}]", text_literal);
-            Ok(By::XPath(xpath))
-        }
-    }
-}
-
 fn entry_kind(meta: &fs::Metadata) -> &'static str {
     if meta.is_file() {
         "file"
@@ -669,13 +574,17 @@ mod tests {
             child_path: sandbox::child_path(path_var.as_deref(), root),
             llm: None,
             browser: None,
+            budgets: budget::Limits::default(),
+            workspace_rules: crate::config::WorkspaceRules::default(),
         }
     }
 
     /// Run one action through an executor over `root`; its report.
     fn run(root: &Utf8Path, allow_proc: &[&str], capability: &str, input: Value) -> ActionReport {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let mut executor = ActionExecutor::new(config(root, allow_proc), runtime.handle().clone());
+        let config = config(root, allow_proc);
+        let budgets = budget::Budgets::shared(config.budgets);
+        let mut executor = ActionExecutor::new(config, runtime.handle().clone(), budgets);
         let action = PlannedAction {
             capability: capability.to_string(),
             input: input.to_string(),

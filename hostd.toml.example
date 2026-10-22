@@ -19,6 +19,22 @@ api_base = "http://127.0.0.1:11434/v1"
 api_key = "ollama"
 model = "phi3.5"
 
+# The run's budgets (the defaults shown). Each operation is paid for before it runs.
+# [budgets]
+# steps = 8                       # planner rounds
+# wallclock_ms = 600000           # the whole run
+# llm_tokens = 200000             # as the endpoint reports them
+# processes = 32
+# filesystem_ops = 10000
+# browser_actions = 200
+# guest_fuel = 10000000000        # wasm work per round; 0 for no limit
+# guest_memory_bytes = 268435456  # the agent's memory
+
+# What the plan may do to the workspace through the fs capability.
+# [workspace]
+# read_only = false
+# max_file_bytes = 16777216
+
 # Browser tasks need a running WebDriver (Chromedriver, Geckodriver, ...).
 # [browser]
 # webdriver_url = "http://127.0.0.1:9515"
