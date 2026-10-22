@@ -306,9 +306,11 @@ fn actions_stop_at_the_wall_clock_budget() {
 #[test]
 #[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
 fn a_plan_is_capped_in_actions_and_in_the_log() {
-    let actions: Vec<serde_json::Value> = (0..100)
-        .map(|_| serde_json::json!({ "capability": "fs.list_dir", "input": {} }))
-        .collect();
+    // First, an action with a 100 KB capability name: its failure is logged, cut.
+    let actions: Vec<serde_json::Value> =
+        std::iter::once(serde_json::json!({ "capability": "y".repeat(100_000), "input": {} }))
+            .chain((0..99).map(|_| serde_json::json!({ "capability": "fs.list_dir", "input": {} })))
+            .collect();
     let (port, seen) = support::fake_llm(vec![
         serde_json::json!({
             "status": "continue",
@@ -324,6 +326,11 @@ fn a_plan_is_capped_in_actions_and_in_the_log() {
     assert!(
         !stderr.contains(&"x".repeat(2_000)),
         "the thought is cut in the log ({} bytes of stderr)",
+        stderr.len()
+    );
+    assert!(
+        stderr.contains("action failed") && !stderr.contains(&"y".repeat(2_000)),
+        "a failed action's capability and error are cut in the log ({} bytes of stderr)",
         stderr.len()
     );
     let seen = seen.lock().expect("log");

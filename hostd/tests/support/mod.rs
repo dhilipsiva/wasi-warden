@@ -192,6 +192,11 @@ pub const SESSION: &str = "fake-session-1";
 /// A W3C WebDriver that opens one session, remembers the URL it is sent to, and answers everything
 /// else with a null value; returns its port and the requests (method, path, body) it saw.
 pub fn fake_webdriver() -> (u16, Requests) {
+    fake_webdriver_quitting_in(std::time::Duration::ZERO)
+}
+
+/// Like [`fake_webdriver`], taking `quit_delay` to answer each request to end a session.
+pub fn fake_webdriver_quitting_in(quit_delay: std::time::Duration) -> (u16, Requests) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     // chromedriver starts a session on `data:,`.
@@ -225,6 +230,10 @@ pub fn fake_webdriver() -> (u16, Requests) {
             }
             ("GET", p) if p == format!("/session/{SESSION}/element/fake-element-1/text") => {
                 serde_json::json!("fake text")
+            }
+            ("DELETE", p) if p.starts_with("/session/") => {
+                thread::sleep(quit_delay);
+                serde_json::Value::Null
             }
             ("POST", p) if p == session_url => {
                 let sent: serde_json::Value = serde_json::from_str(body).unwrap_or_default();

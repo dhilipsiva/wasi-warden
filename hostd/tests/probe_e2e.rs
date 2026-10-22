@@ -729,3 +729,35 @@ fn stdin_and_script_evaluation_are_refused() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A run that completes before its budget is not ended as overdue by the cleanup after it: the
+/// watchdog stands down first. Here quitting the four sessions the agent left open takes 20 s,
+/// well past the budget and its grace.
+#[test]
+#[ignore = "needs probe_agent.wasm: cargo build -p probe-agent --target wasm32-wasip2 --release"]
+fn cleanup_after_a_completed_run_is_not_overdue() {
+    let (port, seen) = support::fake_webdriver_quitting_in(std::time::Duration::from_secs(6));
+    let (root, _ws, config) = probe_setup(
+        "lingering",
+        &format!(
+            "[browser]\nwebdriver_url = \"http://127.0.0.1:{port}\"\nallowed_hosts = []\n[budgets]\nwallclock_ms = 8000\n"
+        ),
+    );
+    let out = support::run_step_within(
+        &support::probe_component(),
+        &config,
+        r#"{"mode":"linger","sessions":4,"ms":5000}"#,
+        std::time::Duration::from_secs(90),
+    )
+    .expect("hostd ended within 90 s");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the run completed: {stderr}");
+    let quits = seen
+        .lock()
+        .expect("webdriver log")
+        .iter()
+        .filter(|(m, _, _)| m == "DELETE")
+        .count();
+    assert_eq!(quits, 4, "each session was quit, once");
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -445,6 +445,22 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
         }
         "browser" => return probe_browser(&task),
         "browser_budget" => return probe_browser_budget(&task),
+        "linger" => {
+            // Sessions left open for the host to quit once the run is over, then a sleep.
+            for _ in 0..task["sessions"].as_u64().unwrap_or(0) {
+                if let Ok(session) = browser::open_session(&SessionOptions {
+                    profile: None,
+                    headless: true,
+                    allow_downloads: false,
+                }) {
+                    std::mem::forget(session);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(task["ms"].as_u64().unwrap_or(0)));
+            let mut out = Map::new();
+            out.insert("lingered".into(), json!(true));
+            return out;
+        }
         "sleep" => {
             // A browser session left open, for the watchdog to quit.
             let session = task["browser"].as_bool().unwrap_or(false).then(|| {
