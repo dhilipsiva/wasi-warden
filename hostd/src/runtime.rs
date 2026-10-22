@@ -139,12 +139,15 @@ fn spent(budgets: &budget::Shared, kind: Kind, what: &str) -> Result<()> {
 fn run_step_blocking(args: StepArgs, tokio_handle: Handle) -> Result<()> {
     let config = HostConfig::from_step_args(&args)?;
     let limits = config.budgets;
+    let engine = build_engine()?;
+    let component = load_component(&engine, &args.component)?;
+    // The run's clock starts once the component is compiled: compiling is the host's work on the
+    // file the operator chose, and its time depends on the host's load. Instantiation runs guest
+    // code, so it is inside the budget.
     let budgets = Budgets::shared(limits);
     let sessions = Sessions::default();
     let deadline = budgets.lock().ok().and_then(|b| b.deadline());
     let _watchdog = Watchdog::start(deadline, limits, sessions.clone(), tokio_handle.clone());
-    let engine = build_engine()?;
-    let component = load_component(&engine, &args.component)?;
     let _ticker = EpochTicker::start(&engine);
 
     let observation_json = validate_json(&args.observation)?;

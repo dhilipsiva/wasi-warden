@@ -270,8 +270,9 @@ The design's rules:
   refuses them. A run holds at most 4 sessions open at once.
 * **Budgets** (`[budgets]` in hostd.toml), shared by both executors:
   * `steps` (8): planner rounds.
-  * `wallclock_ms` (10 minutes): the whole run; a process's timeout, a wait for a page and an LLM request
-    are each cut to the time left. A guest still running at the end is interrupted (wasmtime epochs), and a
+  * `wallclock_ms` (10 minutes): the run, timed from when the component has been compiled (its
+    instantiation included); a process's timeout, a wait for a page and an LLM request are each cut to
+    the time left. A guest still running at the end is interrupted (wasmtime epochs), and a
     run still inside a host call 5 s later (a WASI sleep, a page load) is ended by a watchdog.
   * `llm_tokens` (200,000): the tokens the endpoint reports (its total, or prompt plus completion), or, when
     it reports none, an estimate of a token per four bytes sent and received. A call's `max_tokens` is cut to

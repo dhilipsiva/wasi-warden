@@ -22,7 +22,7 @@ model = "phi3.5"
 # The run's budgets (the defaults shown). Each operation is paid for before it runs.
 # [budgets]
 # steps = 8                       # planner rounds
-# wallclock_ms = 600000           # the whole run
+# wallclock_ms = 600000           # the run, from when the component is compiled
 # llm_tokens = 200000             # as the endpoint reports them
 # processes = 32
 # filesystem_ops = 10000
