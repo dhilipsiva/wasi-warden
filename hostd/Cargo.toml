@@ -30,4 +30,4 @@ base64 = "0.22"
 rustix = { version = "1", features = ["process"] }
 # Parse URLs for the browser host allowlist (sandbox::check_navigation).
 url = "2"
-thirtyfour = { version = "0.34", default-features = false, features = ["rustls-tls"] }
+thirtyfour = { version = "0.36", default-features = false, features = ["rustls-tls"] }
