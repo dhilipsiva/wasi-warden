@@ -42,4 +42,9 @@ e2e name: wasm
     cargo test --locked -p hostd --test {{ name }} -- --include-ignored
 
 # Everything CI checks.
+# The README's quick start, run as a new user would (CI's `readme` job). It copies hostd.toml.example over
+# hostd.toml, so it refuses to run while you have one.
+readme:
+    bash tools/readme-check.sh
+
 ci: lint test doc deny wit (e2e "step_e2e") (e2e "browser_e2e") (e2e "probe_e2e")
