@@ -128,6 +128,18 @@ fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
         &spawn_options(&["30"], Vec::new(), Some(200)),
     )
     .and_then(|p| p.wait(None));
+    // The environment a spawned process sees: the host's PATH and nothing else.
+    let seen_env =
+        proc::spawn(&program("env"), &spawn_options(&[], Vec::new(), None)).and_then(|p| {
+            let read = p.read_stdout(64 * 1024)?;
+            p.close();
+            Ok(String::from_utf8_lossy(&read.data).into_owned())
+        });
+    out.insert(
+        "spawn_env".into(),
+        json!(seen_env.unwrap_or_else(|e| e.message)),
+    );
+
     // Every other way through the symlink out of the workspace.
     let escape_ensure = fs::ensure_dir(ws, "escape/new");
     out.insert("escape_ensure".into(), verdict(&escape_ensure));

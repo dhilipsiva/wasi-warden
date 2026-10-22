@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,10 @@ pub struct HostConfig {
     pub allowed_proc_commands: Vec<String>,
     /// The allowlist resolved when the config loaded: what each entry runs as.
     pub allowed_programs: Vec<AllowedProgram>,
+    /// The environment variables a plan may set for a spawned process ([`sandbox::check_env_key`]).
+    pub allowed_env: Vec<String>,
+    /// The `PATH` the host gives a spawned process ([`sandbox::child_path`]).
+    pub child_path: OsString,
     pub llm: Option<LlmSettings>,
     pub browser: Option<BrowserSettings>,
 }
@@ -58,9 +63,11 @@ impl HostConfig {
         let path_var = std::env::var_os("PATH");
         let allowed_programs = allowed_proc_commands
             .iter()
-            .map(|entry| sandbox::resolve_allowed(entry, path_var.as_deref()))
+            .map(|entry| sandbox::resolve_allowed(entry, path_var.as_deref(), &workspace_root))
             .collect::<Result<Vec<_>, _>>()
             .map_err(anyhow::Error::msg)?;
+        let child_path = sandbox::child_path(path_var.as_deref(), &workspace_root);
+        let allowed_env = file_cfg.allow_env.unwrap_or_default();
         let llm = match file_cfg.llm {
             Some(cfg) => cfg.into_settings()?,
             None => None,
@@ -73,6 +80,8 @@ impl HostConfig {
             workspace_root,
             allowed_proc_commands,
             allowed_programs,
+            allowed_env,
+            child_path,
             llm,
             browser,
         })
@@ -88,6 +97,7 @@ impl HostConfig {
 struct FileConfig {
     workspace_root: Option<String>,
     allow_proc: Option<Vec<String>>,
+    allow_env: Option<Vec<String>>,
     llm: Option<LlmFileSettings>,
     browser: Option<BrowserFileSettings>,
 }

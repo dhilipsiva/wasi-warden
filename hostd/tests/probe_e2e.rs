@@ -55,7 +55,7 @@ fn the_wit_capabilities_hold_their_rules() {
     std::fs::write(
         &config,
         format!(
-            "workspace_root = {:?}\nallow_proc = [\"echo\", \"sleep\"]\n",
+            "workspace_root = {:?}\nallow_proc = [\"echo\", \"sleep\", \"env\"]\n",
             workspace.display().to_string()
         ),
     )
@@ -63,11 +63,12 @@ fn the_wit_capabilities_hold_their_rules() {
     let task = serde_json::json!({
         "echo": "echo",
         "sleep": "sleep",
+        "env": "env",
         "planted": planted.display().to_string(),
     })
     .to_string();
     // Sanity: the allowlist resolves through this PATH.
-    let _ = (which("echo"), which("sleep"));
+    let _ = (which("echo"), which("sleep"), which("env"));
 
     let out = support::run_step_with(&support::probe_component(), &config, &task);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -99,6 +100,16 @@ fn the_wit_capabilities_hold_their_rules() {
         "an unbounded read is capped at 1 MiB: {huge}"
     );
     assert_eq!(results["spawn_echo"], "hi\n", "an allowed program runs");
+    let seen_env = results["spawn_env"].as_str().unwrap_or_default();
+    let names: Vec<&str> = seen_env
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+        .collect();
+    assert_eq!(names, ["PATH"], "only the host's PATH: {seen_env}");
+    assert!(
+        !seen_env.contains(&workspace.display().to_string()),
+        "and none of it in the workspace: {seen_env}"
+    );
     assert_eq!(results["spawn_ld"], "refused", "LD_PRELOAD from the guest");
     assert_eq!(
         results["spawn_planted"], "refused",

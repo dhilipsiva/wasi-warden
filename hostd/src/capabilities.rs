@@ -531,7 +531,10 @@ impl bindings::osagent::fs::fs::Host for HostState {
         &mut self,
         target: Resource<DirHandle>,
     ) -> Result<Vec<bindings::osagent::fs::fs::DirEntry>, CapabilityError> {
+        // Re-checked on every use: the handle's entry may have been swapped for a symlink since it
+        // was opened.
         let dir_path = dir_path(self, &target)?.to_path_buf();
+        let dir_path = confined(self, &dir_path, "")?;
         let mut entries = Vec::new();
         let read = fs::read_dir(&dir_path).map_err(|err| io_error("fs.list-dir", err))?;
         for entry in read {
@@ -554,11 +557,8 @@ impl bindings::osagent::fs::fs::Host for HostState {
         relative_path: Option<String>,
     ) -> Result<bindings::osagent::fs::fs::EntryMetadata, CapabilityError> {
         let base = dir_path(self, &parent)?.to_path_buf();
-        let path = if let Some(rel) = relative_path {
-            confined(self, &base, &rel)?
-        } else {
-            base
-        };
+        // With no relative path, the handle's own path, re-checked (it may have been swapped).
+        let path = confined(self, &base, relative_path.as_deref().unwrap_or(""))?;
         let metadata =
             fs::metadata(path.as_std_path()).map_err(|err| io_error("fs.metadata", err))?;
         Ok(bindings::osagent::fs::fs::EntryMetadata {
@@ -700,7 +700,7 @@ impl bindings::osagent::proc::proc::Host for HostState {
             ));
         };
         for env in &options.env {
-            sandbox::check_env_key(&env.key)
+            sandbox::check_env_key(&env.key, &self.config.allowed_env)
                 .map_err(|why| capability_error(CapabilityErrorCode::Denied, why))?;
         }
 
@@ -746,6 +746,8 @@ impl bindings::osagent::proc::proc::Host for HostState {
         }
 
         cmd.env_clear();
+        // The host's PATH, outside the workspace; the guest cannot set it.
+        cmd.env("PATH", &self.config.child_path);
         for env in options.env {
             cmd.env(env.key, env.value);
         }

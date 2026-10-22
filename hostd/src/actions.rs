@@ -61,7 +61,6 @@ struct BrowserSessionEntry {
 
 struct BrowserElementEntry {
     element: WebElement,
-    #[allow(dead_code)]
     session: String,
 }
 
@@ -214,7 +213,8 @@ impl ActionExecutor {
         };
         if let Some(env) = &params.env {
             for var in env {
-                sandbox::check_env_key(&var.key).map_err(anyhow::Error::msg)?;
+                sandbox::check_env_key(&var.key, &self.config.allowed_env)
+                    .map_err(anyhow::Error::msg)?;
             }
         }
 
@@ -233,6 +233,8 @@ impl ActionExecutor {
         cmd.args(&params.args);
         cmd.current_dir(working_dir.as_std_path());
         cmd.env_clear();
+        // The host's PATH, outside the workspace; the plan cannot set it.
+        cmd.env("PATH", &self.config.child_path);
         if let Some(env) = params.env {
             for var in env {
                 cmd.env(var.key, var.value);
@@ -265,6 +267,7 @@ impl ActionExecutor {
         let profile = params.profile.or_else(|| settings.default_profile.clone());
         let allow_downloads = params.allow_downloads.unwrap_or(false);
         let no_sandbox = settings.chrome_no_sandbox;
+        let download_dir = self.config.workspace_root.to_string();
         let handle = self.tokio.clone();
         let driver = handle.block_on(async move {
             let mut caps = DesiredCapabilities::chrome();
@@ -277,8 +280,10 @@ impl ActionExecutor {
                 caps.add_arg("--no-sandbox")?;
             }
             if allow_downloads {
+                // Into the workspace, not the user's Downloads folder.
                 let prefs = serde_json::json!({
                     "download.prompt_for_download": false,
+                    "download.default_directory": download_dir,
                 });
                 caps.add_experimental_option("prefs", prefs)?;
             }
@@ -294,8 +299,8 @@ impl ActionExecutor {
         let alias = normalized_alias(&params.session)?;
         let driver = self.session_driver(&alias)?;
         let allowed = &self.browser_settings()?.allowed_hosts;
-        sandbox::check_navigation(&params.url, allowed).map_err(anyhow::Error::msg)?;
-        let url = params.url.clone();
+        // The URL as parsed is what the browser gets, so the check and the visit agree.
+        let url = sandbox::check_navigation(&params.url, allowed).map_err(anyhow::Error::msg)?;
         let timeout = params.timeout_ms.unwrap_or(5_000);
         self.tokio.block_on({
             let driver = driver.clone();
@@ -326,7 +331,7 @@ impl ActionExecutor {
     fn browser_session_describe(&self, params: BrowserDescribeInput) -> Result<Value> {
         let alias = normalized_alias(&params.session)?;
         let include_html = params.include_html.unwrap_or(false);
-        let driver = self.session_driver(&alias)?;
+        let driver = self.checked_driver(&alias)?;
         let driver_for_meta = driver.clone();
         let (url, title) = self.tokio.block_on(async move {
             let url = driver_for_meta.current_url().await?.to_string();
@@ -353,7 +358,7 @@ impl ActionExecutor {
         if self.browser_elements.contains_key(&element_alias) {
             bail!("browser element `{element_alias}` already exists");
         }
-        let driver = self.session_driver(&session_alias)?;
+        let driver = self.checked_driver(&session_alias)?;
         let selector = selector_to_by(&params.selector)?;
         let timeout = params.timeout_ms.unwrap_or(5_000);
         let element = self.tokio.block_on(async move {
@@ -376,14 +381,14 @@ impl ActionExecutor {
 
     fn browser_element_click(&self, params: BrowserElementActionInput) -> Result<Value> {
         let element_alias = normalized_alias(&params.element)?;
-        let element = self.element_handle(&element_alias)?;
+        let element = self.checked_element(&element_alias)?;
         self.tokio.block_on(async move { element.click().await })?;
         Ok(json!({ "element": element_alias }))
     }
 
     fn browser_element_type(&self, params: BrowserElementTypeInput) -> Result<Value> {
         let element_alias = normalized_alias(&params.element)?;
-        let element = self.element_handle(&element_alias)?;
+        let element = self.checked_element(&element_alias)?;
         let text = params.text.unwrap_or_default();
         self.tokio
             .block_on(async move { element.send_keys(text).await })?;
@@ -397,7 +402,7 @@ impl ActionExecutor {
 
     fn browser_element_inner_text(&self, params: BrowserElementActionInput) -> Result<Value> {
         let element_alias = normalized_alias(&params.element)?;
-        let element = self.element_handle(&element_alias)?;
+        let element = self.checked_element(&element_alias)?;
         let text = self.tokio.block_on(async move { element.text().await })?;
         Ok(json!({
             "element": element_alias,
@@ -407,7 +412,7 @@ impl ActionExecutor {
 
     fn browser_session_screenshot(&self, params: BrowserScreenshotInput) -> Result<Value> {
         let alias = normalized_alias(&params.session)?;
-        let driver = self.session_driver(&alias)?;
+        let driver = self.checked_driver(&alias)?;
         let raw = self
             .tokio
             .block_on(async move { driver.screenshot_as_png().await })?;
@@ -417,6 +422,46 @@ impl ActionExecutor {
             "kind": params.kind.unwrap_or(ScreenshotKind::Png),
             "data_base64": encoded,
         }))
+    }
+
+    /// The session's page must still be on the allowed hosts (or blank): a page can navigate itself
+    /// (a script, a meta refresh, a followed link) after `goto` checked it. A page that wandered off
+    /// is left for `about:blank` and the action refused.
+    fn ensure_allowed_page(&self, driver: &WebDriver) -> Result<()> {
+        let allowed = &self.browser_settings()?.allowed_hosts;
+        let current = self.tokio.block_on({
+            let driver = driver.clone();
+            async move { driver.current_url().await.map(|u| u.to_string()) }
+        })?;
+        if current == "about:blank" {
+            return Ok(());
+        }
+        if let Err(why) = sandbox::check_navigation(&current, allowed) {
+            self.tokio.block_on({
+                let driver = driver.clone();
+                async move { driver.goto("about:blank").await }
+            })?;
+            bail!("the page left the allowed hosts ({why}); left for about:blank");
+        }
+        Ok(())
+    }
+
+    /// The driver of the session `alias`, after checking its page ([`Self::ensure_allowed_page`]).
+    fn checked_driver(&self, alias: &str) -> Result<WebDriver> {
+        let driver = self.session_driver(alias)?;
+        self.ensure_allowed_page(&driver)?;
+        Ok(driver)
+    }
+
+    /// The element `alias`, after checking its session's page ([`Self::ensure_allowed_page`]).
+    fn checked_element(&self, alias: &str) -> Result<WebElement> {
+        let session = self
+            .browser_elements
+            .get(alias)
+            .map(|entry| entry.session.clone())
+            .ok_or_else(|| anyhow!("unknown browser element `{alias}`"))?;
+        self.ensure_allowed_page(&self.session_driver(&session)?)?;
+        self.element_handle(alias)
     }
 
     /// `relative` under the workspace root ([`sandbox::confine`]).
@@ -618,8 +663,10 @@ mod tests {
             allowed_proc_commands: allow_proc.iter().map(|s| s.to_string()).collect(),
             allowed_programs: allow_proc
                 .iter()
-                .map(|s| sandbox::resolve_allowed(s, path_var.as_deref()).expect("resolves"))
+                .map(|s| sandbox::resolve_allowed(s, path_var.as_deref(), root).expect("resolves"))
                 .collect(),
+            allowed_env: vec!["ONLY".to_string()],
+            child_path: sandbox::child_path(path_var.as_deref(), root),
             llm: None,
             browser: None,
         }
@@ -833,10 +880,29 @@ mod tests {
             json!({ "command": env, "env": [{ "key": "ONLY", "value": "this" }] }),
         );
         assert!(report.success, "{:?}", report.error);
+        let mut lines: Vec<String> = report.output["stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        let path = sandbox::child_path(std::env::var_os("PATH").as_deref(), &root);
         assert_eq!(
-            report.output["stdout"].as_str().unwrap().trim(),
-            "ONLY=this"
+            lines,
+            [
+                "ONLY=this".to_string(),
+                format!("PATH={}", path.to_string_lossy())
+            ],
+            "the allowed variable, and the host's PATH"
         );
+        let unlisted = run(
+            &root,
+            &[env.as_str()],
+            "proc.spawn",
+            json!({ "command": env, "env": [{ "key": "HOME", "value": "/root" }] }),
+        );
+        assert!(!unlisted.success, "a variable off allow_env is refused");
     }
 
     /// The allowlist names programs, not base names: a program planted elsewhere under an allowed

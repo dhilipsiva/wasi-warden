@@ -9,6 +9,10 @@ workspace_root = "./sandbox"
 # hostd starts, or absolute paths. A program missing here is a configuration error.
 allow_proc = ["ls", "echo"]
 
+# Environment variables a plan may set for those programs; none when unset. PATH (the host sets it),
+# the loader's and shell hooks are refused even if listed.
+# allow_env = ["LANG"]
+
 # Any OpenAI-compatible chat-completions endpoint. This one is a local Ollama.
 [llm]
 api_base = "http://127.0.0.1:11434/v1"

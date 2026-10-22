@@ -136,10 +136,13 @@ What does not work yet:
 * **The sandbox isolates only prompt-building code**: the planning happens in the LLM and the actions run in the
   native host, outside the sandbox.
 * **The host's rules have known limits** (both the planner's actions and the WIT capabilities follow them):
-  * paths are checked component by component through symlinks, but the check and the use are separate calls,
-    so a process swapping a directory for a symlink in between could still escape;
-  * the browser's `goto` is confined to `allowed_hosts` and a redirect off them is abandoned, but a link the
-    page clicks through to is not intercepted.
+  * **Paths.** They are checked component by component through symlinks on every call, a stale directory
+    handle included. But the check and the use are separate calls, so a process swapping a directory for a
+    symlink in between could still escape. Only an allowlisted program running alongside could do that.
+    Hard links into the workspace are followed.
+  * **Processes.** A process that leaves its process group (`setsid`, a daemon) is not killed with it.
+  * **Browser.** The page is re-checked before every action, but between two actions it could load
+    anything, and ports are not constrained.
 
 Expect breaking changes. The progress snapshot is in [docs/status.md](docs/status.md).
 
@@ -244,13 +247,18 @@ The design's rules:
 * **Paths.** They stay inside the workspace: no absolute paths, no `..`, and no symlink out of it, dangling
   ones included.
 * **Programs.** A program runs only as `allow_proc` resolved it when the config loaded: a bare name through
-  `PATH`, or an absolute path. A program planted elsewhere under an allowed name does not run.
-* **Environment.** The plan cannot set `LD_*` or `DYLD_*` variables.
-* **Process limits.** A process gets 30 s unless the plan asks for less (300 s at most). A timeout kills its
-  whole process group, and each output stream is capped at 1 MiB.
+  `PATH` (relative entries skipped), or an absolute path. A program planted elsewhere under an allowed name does
+  not run, and no entry may resolve inside the workspace, where the plan could rewrite it.
+* **Environment.** The plan sets only the variables named in `allow_env`. It never sets `PATH` (the host
+  gives the child its own, minus workspace and relative entries), the loader's `LD_*`/`DYLD_*`, exported shell
+  functions, or the hooks shells and interpreters run code from.
+* **Process limits.** A process gets 30 s unless the plan asks for less (300 s at most), and each output stream
+  is capped at 1 MiB. When it exits or times out, its whole process group (its background children included)
+  is killed before it is reaped, and it dies if the host does.
 * **Reads.** A read returns at most 1 MiB.
-* **Browser.** It visits only `allowed_hosts` over http(s), and Chrome keeps its sandbox unless
-  `chrome_no_sandbox` is set.
+* **Browser.** It visits only `allowed_hosts` over http(s): `goto` sends the URL as checked, and every later
+  action first re-checks the page and abandons one that wandered off. Chrome keeps its sandbox unless
+  `chrome_no_sandbox` is set, and downloads, when allowed, land in the workspace.
 * **Rounds.** The loop stops after 8 rounds (`MAX_HOST_STEPS`).
 
 **Not enforced yet:** fuel, wall-clock and token budgets, and an audit log. The limits listed under

@@ -2,24 +2,27 @@
 //! (`actions.rs`) and the WIT capabilities (`capabilities.rs`).
 //!
 //! - Paths stay inside the workspace, through symlinks too ([`confine`]).
-//! - A program runs only as the allowlist resolved it at config load ([`resolve_allowed`],
-//!   [`admit`]).
-//! - The plan cannot set loader variables ([`check_env_key`]).
-//! - A process is bounded in time and output, and a timeout kills its whole process group
-//!   ([`run_bounded`]).
+//! - A program runs only as the allowlist resolved it at config load, never from inside the
+//!   workspace ([`resolve_allowed`], [`admit`]).
+//! - The plan sets only the environment variables the operator allows, never the loader's, `PATH`
+//!   or shell hooks; the host sets the child's `PATH` ([`check_env_key`], [`child_path`]).
+//! - A process is bounded in time and output, and when it ends (or times out) its whole process
+//!   group ends with it ([`run_bounded`]).
 //! - Reads are capped ([`cap_read`]).
 //! - The browser visits only allowed hosts over http(s) ([`check_navigation`]).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use rustix::event::{PollFd, PollFlags};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -32,11 +35,11 @@ pub const DEFAULT_PROC_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest timeout a caller may ask for.
 pub const MAX_PROC_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// After a process exits, how long its output streams may stay open (held by a child it left
-/// running) before that child's process group is killed.
-const EXIT_GRACE: Duration = Duration::from_millis(200);
-/// How long to wait for the output after a kill before returning what was read.
-const KILL_GRACE: Duration = Duration::from_secs(2);
+/// After a process ends, how long to keep reading what it already wrote. A process that left the
+/// group (`setsid`) and still holds the output cannot hold the caller past this.
+const DRAIN_GRACE: Duration = Duration::from_millis(200);
+/// How often the runner looks at the process while it waits for output.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Why a path was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,9 +162,14 @@ fn resolved(dir: &Path, name: &OsStr) -> Option<PathBuf> {
 }
 
 /// Resolve one allowlist entry: a bare name through `path_var` (the host's `PATH` when the config
-/// loads), an absolute path as written. Anything else, or a program that does not exist, is a
-/// configuration error.
-pub fn resolve_allowed(entry: &str, path_var: Option<&OsStr>) -> Result<AllowedProgram, String> {
+/// loads; relative entries skipped), an absolute path as written. Anything else, a program that does
+/// not exist, or one that resolves (through any symlink) inside the workspace `root`, where the plan
+/// could rewrite it, is a configuration error.
+pub fn resolve_allowed(
+    entry: &str,
+    path_var: Option<&OsStr>,
+    root: &Utf8Path,
+) -> Result<AllowedProgram, String> {
     let program = Path::new(entry);
     let path = if entry.is_empty() {
         None
@@ -177,19 +185,49 @@ pub fn resolve_allowed(entry: &str, path_var: Option<&OsStr>) -> Result<AllowedP
         }
     } else {
         path_var.and_then(|paths| {
-            std::env::split_paths(paths).find_map(|dir| {
-                dir.join(entry)
-                    .is_file()
-                    .then(|| resolved(&dir, OsStr::new(entry)))
-                    .flatten()
-            })
+            std::env::split_paths(paths)
+                .filter(|dir| dir.is_absolute())
+                .find_map(|dir| {
+                    dir.join(entry)
+                        .is_file()
+                        .then(|| resolved(&dir, OsStr::new(entry)))
+                        .flatten()
+                })
         })
     };
-    path.map(|path| AllowedProgram {
+    let path =
+        path.ok_or_else(|| format!("allow_proc entry `{entry}` is not a program on this host"))?;
+    if inside_workspace(&path, root) {
+        return Err(format!(
+            "allow_proc entry `{entry}` resolves inside the workspace, where the plan could rewrite it"
+        ));
+    }
+    Ok(AllowedProgram {
         name: entry.to_string(),
         path,
     })
-    .ok_or_else(|| format!("allow_proc entry `{entry}` is not a program on this host"))
+}
+
+/// Whether `path`, every symlink followed, lies inside the workspace `root`.
+fn inside_workspace(path: &Path, root: &Utf8Path) -> bool {
+    match (fs::canonicalize(path), fs::canonicalize(root)) {
+        (Ok(path), Ok(root)) => within(&root, &path),
+        // An unresolvable root or program cannot be shown to be outside: treat it as inside.
+        _ => true,
+    }
+}
+
+/// The `PATH` the host gives a spawned process: its own `path_var`, keeping only absolute
+/// directories outside the workspace `root` (so a plan cannot plant a program a script calls).
+pub fn child_path(path_var: Option<&OsStr>, root: &Utf8Path) -> OsString {
+    let dirs = path_var
+        .map(|paths| {
+            std::env::split_paths(paths)
+                .filter(|dir| dir.is_absolute() && !inside_workspace(dir, root))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    std::env::join_paths(dirs).unwrap_or_default()
 }
 
 /// The program to run for `requested`, if the allowlist admits it. A bare name matches an entry
@@ -216,15 +254,48 @@ pub fn admit<'a>(allowed: &'a [AllowedProgram], requested: &str) -> Option<&'a P
         .map(|a| a.path.as_path())
 }
 
-/// Whether the plan may set `key` in a spawned process's environment. Loader variables (`LD_*`,
-/// `DYLD_*`) would let it inject code into an allowed program; an empty key or one holding `=` or
-/// NUL is malformed.
-pub fn check_env_key(key: &str) -> Result<(), String> {
+/// Variables no plan may set even when the operator lists them: the dynamic loader's, the child's
+/// `PATH` (the host sets it), and the hooks shells and interpreters run code from.
+const NEVER_FROM_THE_PLAN: [&str; 16] = [
+    "PATH",
+    "BASH_ENV",
+    "ENV",
+    "IFS",
+    "SHELLOPTS",
+    "PS4",
+    "GCONV_PATH",
+    "GLIBC_TUNABLES",
+    "LOCPATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PERL5LIB",
+    "PERL5OPT",
+    "RUBYOPT",
+];
+
+/// Whether the plan may set `key` in a spawned process's environment: only names on the operator's
+/// `allowed` list, and never the loader's (`LD_*`, `DYLD_*`), exported shell functions
+/// (`BASH_FUNC_*`), git's config injection (`GIT_CONFIG*`, `GIT_SSH*`, `GIT_ASKPASS`,
+/// `GIT_EXEC_PATH`) or [`NEVER_FROM_THE_PLAN`]. An empty name, or one holding `=` or NUL, is
+/// malformed.
+pub fn check_env_key(key: &str, allowed: &[String]) -> Result<(), String> {
     if key.is_empty() || key.contains('=') || key.contains('\0') {
         return Err(format!("environment variable name `{key}` is malformed"));
     }
-    if key.starts_with("LD_") || key.starts_with("DYLD_") {
+    let never = NEVER_FROM_THE_PLAN.contains(&key)
+        || ["LD_", "DYLD_", "BASH_FUNC_", "GIT_CONFIG", "GIT_SSH"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        || matches!(key, "GIT_ASKPASS" | "GIT_EXEC_PATH");
+    if never {
         return Err(format!("environment variable `{key}` is not allowed"));
+    }
+    if !allowed.iter().any(|a| a == key) {
+        return Err(format!(
+            "environment variable `{key}` is not in the host's allow_env"
+        ));
     }
     Ok(())
 }
@@ -254,98 +325,140 @@ pub struct Bounded {
     pub timed_out: bool,
 }
 
-/// What a reader thread has read so far: the bytes kept, and whether any were dropped.
-type Captured = Arc<Mutex<(Vec<u8>, bool)>>;
+/// One of a process's output streams, read as it comes, keeping at most [`MAX_OUTPUT_BYTES`].
+struct Stream<R> {
+    pipe: Option<R>,
+    kept: Vec<u8>,
+    truncated: bool,
+}
 
-/// Read `pipe` to its end on a thread, keeping at most [`MAX_OUTPUT_BYTES`] and draining the rest
-/// so the writer never blocks on a full pipe. The receiver hears once the stream has closed.
-fn capture(pipe: Option<impl Read + Send + 'static>) -> (Captured, mpsc::Receiver<()>) {
-    let captured: Captured = Arc::default();
-    let (done, finished) = mpsc::channel();
-    let sink = Arc::clone(&captured);
-    thread::spawn(move || {
-        if let Some(mut pipe) = pipe {
-            let mut chunk = [0u8; 16 * 1024];
-            while let Ok(n) = pipe.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                let Ok(mut out) = sink.lock() else { break };
-                let room = MAX_OUTPUT_BYTES.saturating_sub(out.0.len());
-                out.0.extend_from_slice(&chunk[..n.min(room)]);
-                if n > room {
-                    out.1 = true;
-                }
+impl<R: Read> Stream<R> {
+    fn new(pipe: Option<R>) -> Self {
+        Self {
+            pipe,
+            kept: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    /// Read what is ready (the caller polled first); the stream closes at its end or on an error.
+    fn take_ready(&mut self) {
+        let Some(pipe) = self.pipe.as_mut() else {
+            return;
+        };
+        let mut chunk = [0u8; 16 * 1024];
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => self.pipe = None,
+            Ok(n) => {
+                let room = MAX_OUTPUT_BYTES.saturating_sub(self.kept.len());
+                self.kept.extend_from_slice(&chunk[..n.min(room)]);
+                self.truncated |= n > room;
             }
         }
-        let _ = done.send(());
-    });
-    (captured, finished)
+    }
 }
 
-/// Kill `child`'s process group (the child leads it: [`run_bounded`] starts it in its own).
-fn kill_group(child: &Child) {
-    let pid = rustix::process::Pid::from_child(child);
-    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+/// Wait up to `wait` for either stream to have output or close, then read what is ready. With both
+/// streams closed it just sleeps.
+fn pump(out: &mut Stream<ChildStdout>, err: &mut Stream<ChildStderr>, wait: Duration) {
+    let ready = {
+        let mut fds = Vec::with_capacity(2);
+        let mut which = Vec::with_capacity(2);
+        if let Some(p) = &out.pipe {
+            fds.push(PollFd::new(p, PollFlags::IN));
+            which.push(0);
+        }
+        if let Some(p) = &err.pipe {
+            fds.push(PollFd::new(p, PollFlags::IN));
+            which.push(1);
+        }
+        if fds.is_empty() {
+            thread::sleep(wait);
+            return;
+        }
+        let timeout = rustix::time::Timespec::try_from(wait).ok();
+        if rustix::event::poll(&mut fds, timeout.as_ref()).is_err() {
+            return; // interrupted; the caller loops
+        }
+        fds.iter()
+            .zip(which)
+            .filter(|(fd, _)| !fd.revents().is_empty())
+            .map(|(_, w)| w)
+            .collect::<Vec<_>>()
+    };
+    for w in ready {
+        if w == 0 {
+            out.take_ready();
+        } else {
+            err.take_ready();
+        }
+    }
 }
 
-/// Wait for both readers until `deadline`; whether both finished.
-fn readers_done(readers: &[&mpsc::Receiver<()>], deadline: Instant) -> bool {
-    readers.iter().all(|r| {
-        let left = deadline.saturating_duration_since(Instant::now());
-        r.recv_timeout(left).is_ok()
-    })
+/// Whether the process `pid` has exited, without reaping it: while it is unreaped its pid still
+/// names its process group, so a group kill cannot reach any other process.
+fn exited(pid: Pid) -> io::Result<bool> {
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    Ok(rustix::process::waitid(WaitId::Pid(pid), options)?.is_some())
 }
 
-/// Run `cmd` with stdin closed and its output piped, in a process group of its own, keeping at
-/// most [`MAX_OUTPUT_BYTES`] of each stream. Past `timeout` the whole group is killed. A child the
-/// command leaves holding its output open is killed with the group shortly after the command exits.
+/// Run `cmd` with stdin closed and its output piped, in a process group of its own, keeping at most
+/// [`MAX_OUTPUT_BYTES`] of each stream. When the command exits, or `timeout` passes, the whole group
+/// is killed (the command's background children included) before the command is reaped, and what
+/// was already written is read for a moment longer. The command also dies if the host does.
+///
+/// Known limit: a process that leaves the group (`setsid`, a daemon) is not killed; it can only
+/// come from an allowlisted program, and the caller stops reading it after [`DRAIN_GRACE`].
 pub fn run_bounded(mut cmd: Command, timeout: Duration) -> io::Result<Bounded> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    // SAFETY: the closure runs in the forked child before `exec`, where only async-signal-safe calls
+    // are sound; it makes one `prctl` system call and touches no memory shared with the parent.
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::set_parent_process_death_signal(Some(Signal::KILL))
+                .map_err(io::Error::from)
+        });
+    }
     let mut child = cmd.spawn()?;
-    let (stdout, out_done) = capture(child.stdout.take());
-    let (stderr, err_done) = capture(child.stderr.take());
+    let pid = Pid::from_child(&child);
+    let mut out = Stream::new(child.stdout.take());
+    let mut err = Stream::new(child.stderr.take());
     let deadline = Instant::now() + timeout;
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            break (status, false);
+    let mut timed_out = false;
+    loop {
+        if exited(pid)? {
+            break;
         }
         if Instant::now() >= deadline {
-            // The child is not yet reaped, so its pid still names its process group.
-            kill_group(&child);
-            break (child.wait()?, true);
+            timed_out = true;
+            break;
         }
-        thread::sleep(Duration::from_millis(5));
-    };
-    let readers = [&out_done, &err_done];
-    if !readers_done(&readers, Instant::now() + EXIT_GRACE) {
-        // Something the command started still holds its output open, so the group still has a
-        // member and its id cannot have been reused: end it.
-        kill_group(&child);
-        readers_done(&readers, Instant::now() + KILL_GRACE);
+        pump(&mut out, &mut err, POLL_INTERVAL);
     }
-    let take = |c: &Captured| {
-        c.lock()
-            .map(|mut g| (std::mem::take(&mut g.0), g.1))
-            .unwrap_or_default()
-    };
-    let ((stdout, stdout_truncated), (stderr, stderr_truncated)) = (take(&stdout), take(&stderr));
+    // The command is still unreaped here, so its pid names its group: end the whole group, then reap.
+    let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+    let status = child.wait()?;
+    let drain_until = Instant::now() + DRAIN_GRACE;
+    while (out.pipe.is_some() || err.pipe.is_some()) && Instant::now() < drain_until {
+        pump(&mut out, &mut err, POLL_INTERVAL);
+    }
     Ok(Bounded {
         status: if timed_out { None } else { status.code() },
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
+        stdout: out.kept,
+        stderr: err.kept,
+        stdout_truncated: out.truncated,
+        stderr_truncated: err.truncated,
         timed_out,
     })
 }
 
 /// Whether the browser may go to `url`: http or https only, to a host on `allowed` (exactly, or
-/// `*.example.com` for its subdomains), compared without case. An empty list allows nothing.
-pub fn check_navigation(url: &str, allowed: &[String]) -> Result<(), String> {
+/// `*.example.com` for its subdomains), compared without case. An empty list allows nothing. Returns
+/// the URL as parsed, which is what the browser should be sent. Ports are not constrained.
+pub fn check_navigation(url: &str, allowed: &[String]) -> Result<String, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("`{url}` is not a URL: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("`{url}`: only http and https pages may be visited"));
@@ -362,7 +475,7 @@ pub fn check_navigation(url: &str, allowed: &[String]) -> Result<(), String> {
         }
     });
     if allowed_host {
-        Ok(())
+        Ok(parsed.to_string())
     } else {
         Err(format!(
             "host `{host}` is not in the browser's allowed_hosts"
@@ -489,25 +602,60 @@ mod tests {
 
     // ── Programs and environment ────────────────────────────────────────────
 
+    /// A workspace somewhere else, for allowlist entries that must resolve outside it.
+    fn elsewhere() -> Utf8PathBuf {
+        scratch("not-here")
+    }
+
     #[test]
     fn an_allowlist_entry_resolves_through_path_and_keeps_its_name() {
         let path_var = std::env::var_os("PATH");
-        let echo = resolve_allowed("echo", path_var.as_deref()).unwrap();
+        let ws = elsewhere();
+        let echo = resolve_allowed("echo", path_var.as_deref(), &ws).unwrap();
         assert!(echo.path.is_absolute() && echo.path.ends_with("echo"));
-        let again = resolve_allowed(echo.path.to_str().unwrap(), None).unwrap();
+        let again = resolve_allowed(echo.path.to_str().unwrap(), None, &ws).unwrap();
         assert_eq!(
             again.path, echo.path,
             "an absolute entry resolves to the same file"
         );
-        assert!(resolve_allowed("no-such-program-xyz", path_var.as_deref()).is_err());
-        assert!(resolve_allowed("bin/echo", path_var.as_deref()).is_err());
-        assert!(resolve_allowed("", path_var.as_deref()).is_err());
+        assert!(resolve_allowed("no-such-program-xyz", path_var.as_deref(), &ws).is_err());
+        assert!(resolve_allowed("bin/echo", path_var.as_deref(), &ws).is_err());
+        assert!(resolve_allowed("", path_var.as_deref(), &ws).is_err());
+    }
+
+    /// A program the plan could rewrite (inside the workspace, directly, through a PATH entry or
+    /// through a symlink) is never allowed; relative PATH entries are not searched.
+    #[test]
+    fn an_allowlist_entry_never_resolves_inside_the_workspace() {
+        let ws = scratch("ws-programs");
+        fs::create_dir(ws.join("bin")).unwrap();
+        fs::write(ws.join("bin/tool"), "#!/bin/sh\n").unwrap();
+        let bin = OsString::from(ws.join("bin").as_str());
+        assert!(
+            resolve_allowed("tool", Some(&bin), &ws).is_err(),
+            "through PATH"
+        );
+        assert!(
+            resolve_allowed(ws.join("bin/tool").as_str(), None, &ws).is_err(),
+            "absolute"
+        );
+        let outside = scratch("ws-programs-out");
+        std::os::unix::fs::symlink(ws.join("bin/tool"), outside.join("tool")).unwrap();
+        assert!(
+            resolve_allowed(outside.join("tool").as_str(), None, &ws).is_err(),
+            "a link from outside into the workspace"
+        );
+        let relative = OsString::from("bin");
+        assert!(
+            resolve_allowed("tool", Some(&relative), &ws).is_err(),
+            "a relative PATH entry"
+        );
     }
 
     #[test]
     fn admission_is_by_name_or_resolved_path_never_by_base_name() {
         let path_var = std::env::var_os("PATH");
-        let allowed = [resolve_allowed("echo", path_var.as_deref()).unwrap()];
+        let allowed = [resolve_allowed("echo", path_var.as_deref(), &elsewhere()).unwrap()];
         let echo = allowed[0].path.clone();
         assert_eq!(admit(&allowed, "echo"), Some(echo.as_path()));
         assert_eq!(
@@ -522,21 +670,51 @@ mod tests {
     }
 
     #[test]
-    fn loader_and_malformed_variables_are_refused() {
+    fn the_plan_sets_only_allowed_variables_and_never_dangerous_ones() {
+        let allowed: Vec<String> = ["HOME", "RUST_LOG", "PATH", "LD_PRELOAD", "BASH_FUNC_ls%%"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for key in ["HOME", "RUST_LOG"] {
+            assert!(check_env_key(key, &allowed).is_ok(), "{key}");
+        }
+        assert!(check_env_key("TERM", &allowed).is_err(), "not on the list");
         for key in [
+            "PATH",
             "LD_PRELOAD",
             "LD_LIBRARY_PATH",
-            "LD_AUDIT",
             "DYLD_INSERT_LIBRARIES",
+            "BASH_FUNC_ls%%",
+            "BASH_ENV",
+            "GCONV_PATH",
+            "GIT_CONFIG_COUNT",
+            "GIT_SSH_COMMAND",
             "",
             "A=B",
             "A\0B",
         ] {
-            assert!(check_env_key(key).is_err(), "{key:?}");
+            assert!(
+                check_env_key(key, &allowed).is_err(),
+                "{key:?} even when listed"
+            );
         }
-        for key in ["HOME", "RUST_LOG", "OLD_PRELOAD"] {
-            assert!(check_env_key(key).is_ok(), "{key}");
-        }
+    }
+
+    #[test]
+    fn a_childs_path_keeps_only_absolute_directories_outside_the_workspace() {
+        let ws = scratch("childpath");
+        fs::create_dir(ws.join("bin")).unwrap();
+        let outside = scratch("childpath-out");
+        let path_var = std::env::join_paths([
+            PathBuf::from(outside.as_str()),
+            PathBuf::from(ws.join("bin").as_str()),
+            PathBuf::from("relative/bin"),
+        ])
+        .unwrap();
+        assert_eq!(
+            child_path(Some(&path_var), &ws),
+            OsString::from(outside.as_str())
+        );
     }
 
     #[test]
