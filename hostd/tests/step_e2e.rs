@@ -75,7 +75,7 @@ fn a_spawned_process_dies_with_the_host() {
         .replace("allow_proc = []", "allow_proc = [\"sh\"]");
     std::fs::write(&config, text).unwrap();
     let mut host = std::process::Command::new(env!("CARGO_BIN_EXE_hostd"))
-        .arg("step")
+        .arg("run")
         .arg("--component")
         .arg(support::component())
         .arg("--config")
@@ -704,4 +704,91 @@ fn a_reply_without_content_falls_back() {
         "and the frontier answered each time"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `hostd step` runs one planner round and prints where it got to as JSON: the next step's number
+/// and observation, which a caller passes back, until the planner completes.
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn step_runs_one_round_and_prints_the_next_observation() {
+    let root = support::scratch_dir("onestep");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("planted.txt"), "x").expect("plant");
+    let (port, seen) = support::fake_llm(vec![
+        serde_json::json!({
+            "status": "continue",
+            "thought": "list",
+            "actions": [{ "capability": "fs.list_dir", "input": {} }]
+        }),
+        serde_json::json!({ "status": "complete", "thought": "done", "actions": [], "reason": "listed" }),
+    ]);
+    let config = root.join("hostd.toml");
+    support::write_config(&config, &workspace, port, None);
+    let component = support::component();
+    let base = [
+        "step",
+        "--component",
+        component.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--task",
+        "List workspace files",
+    ];
+    let first = support::hostd(&base);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let printed: serde_json::Value =
+        serde_json::from_slice(&first.stdout).expect("step prints one JSON object");
+    assert_eq!(printed["status"], "continue", "{printed}");
+    assert_eq!(printed["step"], 1, "{printed}");
+    assert!(
+        printed["observation"].to_string().contains("planted.txt"),
+        "{printed}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "one round: one request to the planner's model"
+    );
+
+    let observation = printed["observation"].to_string();
+    let mut next = base.to_vec();
+    next.extend(["--step", "1", "--observation", observation.as_str()]);
+    let second = support::hostd(&next);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let done: serde_json::Value = serde_json::from_slice(&second.stdout).expect("JSON");
+    assert_eq!(done["status"], "complete", "{done}");
+    assert_eq!(done["reason"], "listed", "{done}");
+    assert!(
+        seen.lock().unwrap()[1].contains("planted.txt"),
+        "the second round saw the observation passed back"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// hostd has both commands: `run` (the whole loop) and `step` (one round).
+#[test]
+fn run_and_step_are_both_commands() {
+    let help = support::hostd(&["--help"]);
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.status.success() && text.contains("run") && text.contains("step"),
+        "{text}"
+    );
+    for command in ["run", "step"] {
+        let out = support::hostd(&[command, "--help"]);
+        assert!(
+            out.status.success(),
+            "{command} --help: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

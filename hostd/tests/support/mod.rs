@@ -155,6 +155,16 @@ fn serve(handle: impl Fn(&str, &str, &str) -> String + Send + Sync + 'static) ->
     port
 }
 
+/// Run hostd with `args` (and `RUST_LOG=info`, no proxy variables); its output.
+pub fn hostd(args: &[&str]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hostd"));
+    cmd.args(args).env("RUST_LOG", "info");
+    for var in PROXY_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.output().expect("run hostd")
+}
+
 /// The fake servers are on loopback; a proxy from the environment would intercept them.
 const PROXY_VARS: [&str; 6] = [
     "HTTP_PROXY",
@@ -381,7 +391,7 @@ pub fn run_step_within(
     limit: std::time::Duration,
 ) -> Option<Output> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hostd"));
-    cmd.arg("step")
+    cmd.arg("run")
         .arg("--component")
         .arg(component)
         .arg("--config")
@@ -452,7 +462,7 @@ pub fn run_step_with(component: &Path, config: &Path, task: &str) -> Output {
 /// Like [`run_step_with`], with `RUST_LOG` set to `rust_log`.
 pub fn run_step_logged(component: &Path, config: &Path, task: &str, rust_log: &str) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hostd"));
-    cmd.arg("step")
+    cmd.arg("run")
         .arg("--component")
         .arg(component)
         .arg("--config")
