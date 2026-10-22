@@ -113,6 +113,14 @@ fn serve(handle: impl Fn(&str, &str, &str) -> String + Send + Sync + 'static) ->
 /// A chat-completions endpoint answering each request with the next of `plans` (the last repeats);
 /// returns its port and the request bodies it saw.
 pub fn fake_llm(plans: Vec<serde_json::Value>) -> (u16, Arc<Mutex<Vec<String>>>) {
+    fake_llm_costing(plans, 2)
+}
+
+/// Like [`fake_llm`], reporting `tokens` total tokens used per request.
+pub fn fake_llm_costing(
+    plans: Vec<serde_json::Value>,
+    tokens: u32,
+) -> (u16, Arc<Mutex<Vec<String>>>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     let port = serve(move |_method, _path, body| {
@@ -127,7 +135,7 @@ pub fn fake_llm(plans: Vec<serde_json::Value>) -> (u16, Arc<Mutex<Vec<String>>>)
                 "message": { "role": "assistant", "content": plan.to_string() },
                 "finish_reason": "stop"
             }],
-            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            "usage": { "prompt_tokens": tokens / 2, "completion_tokens": tokens - tokens / 2, "total_tokens": tokens }
         })
         .to_string()
     });
@@ -160,6 +168,15 @@ pub fn fake_webdriver() -> (u16, Requests) {
                 "capabilities": { "browserName": "chrome" }
             }),
             ("GET", "/status") => serde_json::json!({ "ready": true, "message": "fake" }),
+            ("GET", p) if p == format!("/session/{SESSION}/title") => {
+                serde_json::json!("Fake title")
+            }
+            ("POST", p) if p == format!("/session/{SESSION}/element") => {
+                serde_json::json!({ "element-6066-11e4-a52e-4f735466cecf": "fake-element-1" })
+            }
+            ("GET", p) if p == format!("/session/{SESSION}/element/fake-element-1/text") => {
+                serde_json::json!("fake text")
+            }
             ("POST", p) if p == session_url => {
                 let sent: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
                 if let Some(u) = sent["url"].as_str() {
@@ -204,6 +221,46 @@ pub fn write_config(path: &Path, workspace: &Path, llm_port: u16, webdriver_port
         ));
     }
     std::fs::write(path, config).expect("config");
+}
+
+/// Append `extra` (whole TOML sections, such as `[budgets]`) to the config at `path`.
+pub fn append_config(path: &Path, extra: &str) {
+    let mut config = std::fs::read_to_string(path).expect("config");
+    config.push('\n');
+    config.push_str(extra);
+    std::fs::write(path, config).expect("config");
+}
+
+/// Run `hostd step` like [`run_step_with`], killing it after `limit`; `None` if it had to be killed.
+pub fn run_step_within(
+    component: &Path,
+    config: &Path,
+    task: &str,
+    limit: std::time::Duration,
+) -> Option<Output> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hostd"));
+    cmd.arg("step")
+        .arg("--component")
+        .arg(component)
+        .arg("--config")
+        .arg(config)
+        .args(["--task", task, "--observation", "{}"])
+        .env("RUST_LOG", "info")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("run hostd");
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if child.try_wait().expect("wait").is_some() {
+            return Some(child.wait_with_output().expect("output"));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Run `hostd step` for `task` with the agent component and `config`.

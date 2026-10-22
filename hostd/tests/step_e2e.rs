@@ -119,3 +119,126 @@ fn a_spawned_process_dies_with_the_host() {
     assert!(gone, "the child {pid} outlived the host");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A plan that keeps asking for `actions` and never completes.
+fn never_completes(actions: serde_json::Value) -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "status": "continue",
+        "thought": "again",
+        "actions": actions
+    })]
+}
+
+/// A workspace and a config with `extra` sections for an LLM on `port`; returns (root, config).
+fn setup(name: &str, port: u16, extra: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = support::scratch_dir(name);
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let config = root.join("hostd.toml");
+    support::write_config(&config, &workspace, port, None);
+    support::append_config(&config, extra);
+    (root, config)
+}
+
+/// The observation data the planner was sent in request `n` (0-based).
+fn observed(seen: &[String], n: usize) -> serde_json::Value {
+    let request: serde_json::Value = serde_json::from_str(&seen[n]).expect("request JSON");
+    let content = request["messages"][1]["content"]
+        .as_str()
+        .unwrap_or_default();
+    let data = content
+        .split_once("Observation data: ")
+        .map(|(_, d)| d)
+        .unwrap_or("{}");
+    serde_json::from_str(data).unwrap_or_default()
+}
+
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn the_step_budget_stops_a_plan_that_never_completes() {
+    let (port, seen) = support::fake_llm(never_completes(serde_json::json!([
+        { "capability": "fs.list_dir", "input": {} }
+    ])));
+    let (root, config) = setup("steps", port, "[budgets]\nsteps = 2\n");
+    let out = support::run_step(&config, "Never finish");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("step budget"), "{stderr}");
+    assert_eq!(
+        seen.lock().expect("log").len(),
+        2,
+        "two planner rounds, as budgeted"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn the_token_budget_stops_the_loop() {
+    let (port, seen) = support::fake_llm_costing(
+        never_completes(serde_json::json!([{ "capability": "fs.list_dir", "input": {} }])),
+        600,
+    );
+    let (root, config) = setup("tokens", port, "[budgets]\nllm_tokens = 1000\n");
+    let out = support::run_step(&config, "Spend tokens");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("token budget"), "{stderr}");
+    assert_eq!(
+        seen.lock().expect("log").len(),
+        2,
+        "the second request spent past the budget"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn the_process_and_filesystem_budgets_refuse_extra_operations() {
+    let (port, seen) = support::fake_llm(vec![
+        serde_json::json!({
+            "status": "continue",
+            "thought": "use up the budgets",
+            "actions": [
+                { "capability": "proc.spawn", "input": { "command": "echo", "args": ["one"] } },
+                { "capability": "proc.spawn", "input": { "command": "echo", "args": ["two"] } },
+                { "capability": "fs.list_dir", "input": {} },
+                { "capability": "fs.list_dir", "input": {} }
+            ]
+        }),
+        serde_json::json!({ "status": "complete", "thought": "done", "actions": [], "reason": "done" }),
+    ]);
+    let (root, config) = setup(
+        "procfs",
+        port,
+        "[budgets]\nprocesses = 1\nfilesystem_ops = 1\n",
+    );
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("allow_proc = []", "allow_proc = [\"echo\"]");
+    std::fs::write(&config, text).unwrap();
+    let out = support::run_step(&config, "Spend budgets");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let seen = seen.lock().expect("log");
+    let actions = observed(&seen, 1)["actions"].clone();
+    let ok: Vec<bool> = actions
+        .as_array()
+        .expect("actions")
+        .iter()
+        .map(|a| a["success"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(
+        ok,
+        [true, false, true, false],
+        "one of each, as budgeted: {actions}"
+    );
+    assert!(
+        actions[1]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("budget"),
+        "{actions}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

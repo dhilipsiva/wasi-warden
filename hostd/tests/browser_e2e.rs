@@ -249,3 +249,51 @@ fn a_fresh_session_works_and_element_actions_recheck_the_page() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+#[ignore = "needs agent_core.wasm: cargo build -p agent-core --target wasm32-wasip2 --release"]
+fn the_browser_action_budget_refuses_extra_actions() {
+    let root = support::scratch_dir("browserbudget");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let (llm_port, llm_seen) = support::fake_llm(vec![
+        serde_json::json!({
+            "status": "continue",
+            "thought": "three browser actions",
+            "actions": [
+                { "capability": "browser.open_session", "input": { "alias": "s1" } },
+                {
+                    "capability": "browser.session.goto",
+                    "input": { "session": "s1", "url": "http://login.example.test/", "timeout_ms": 0 }
+                },
+                { "capability": "browser.session.describe_page", "input": { "session": "s1" } }
+            ]
+        }),
+        serde_json::json!({ "status": "complete", "thought": "done", "actions": [], "reason": "done" }),
+    ]);
+    let (wd_port, _wd_seen) = support::fake_webdriver();
+    let config = root.join("hostd.toml");
+    support::write_config(&config, &workspace, llm_port, Some(wd_port));
+    support::append_config(&config, "[budgets]\nbrowser_actions = 2\n");
+    let out = support::run_step(&config, "Browse");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let llm = llm_seen.lock().expect("llm log");
+    let report: serde_json::Value = serde_json::from_str(&llm[1]).expect("request JSON");
+    let content = report["messages"][1]["content"]
+        .as_str()
+        .unwrap_or_default();
+    let data = content
+        .split_once("Observation data: ")
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let observed: serde_json::Value = serde_json::from_str(data).expect("observation JSON");
+    let ok: Vec<bool> = observed["actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .map(|a| a["success"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(ok, [true, true, false], "two browser actions, as budgeted");
+    let _ = std::fs::remove_dir_all(&root);
+}

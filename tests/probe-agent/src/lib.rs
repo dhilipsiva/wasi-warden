@@ -1,7 +1,9 @@
 //! A test guest for hostd's end-to-end tests (`hostd/tests/probe_e2e.rs`). Where agent-core only asks
 //! the `llm` capability for a plan, this calls the fs and proc capabilities and WASI itself, through
 //! the real bindings, and records what each call returned in `results.json` in the workspace. The
-//! task is a JSON object naming the programs to try (`echo`, `sleep`, `planted`).
+//! task is a JSON object: `mode` picks what to probe (`rules`, the default; `write_ops`; `policy`;
+//! `browser`; `input`; or `burn`, which loops forever), and the rest names the programs and URLs to
+//! try.
 
 use std::time::{Duration, Instant};
 
@@ -17,7 +19,11 @@ mod bindings {
 }
 
 use bindings::exports::osagent::agent::planner::{self, AgentError, CompletePlan, StepResponse};
+use bindings::osagent::browser::browser::{self, Selector, SelectorKind, SessionOptions};
+use bindings::osagent::common::types::AuditEvent;
 use bindings::osagent::fs::fs::{self, DirHandle, FileOpenOptions};
+use bindings::osagent::input::input;
+use bindings::osagent::policy::policy::{self, BudgetKind, GrantRequest};
 use bindings::osagent::proc::proc::{self, EnvVar, SpawnOptions, StdioMode};
 
 struct Probe;
@@ -49,8 +55,190 @@ fn verdict<T, E>(r: &Result<T, E>) -> Value {
     json!(if r.is_ok() { "allowed" } else { "refused" })
 }
 
+fn write_only() -> FileOpenOptions {
+    FileOpenOptions {
+        read: false,
+        write: true,
+        append: false,
+        create: true,
+        truncate: true,
+    }
+}
+
+/// "refused: <message>" for an error, "allowed" otherwise.
+fn outcome<T>(r: &Result<T, bindings::osagent::common::types::CapabilityError>) -> Value {
+    match r {
+        Ok(_) => json!("allowed"),
+        Err(e) => json!(format!("refused: {}", e.message)),
+    }
+}
+
+/// Every kind of write, for the workspace rules (`read_only`, `max_file_bytes`).
+fn probe_writes(ws: &DirHandle) -> Map<String, Value> {
+    let mut out = Map::new();
+    out.insert("ensure_dir".into(), outcome(&fs::ensure_dir(ws, "new-dir")));
+    let small =
+        fs::open_file(ws, "small.txt", write_only()).and_then(|f| f.write_string("ok", false));
+    out.insert("small_write".into(), outcome(&small));
+    let big = fs::open_file(ws, "big.txt", write_only()).and_then(|f| f.write(&vec![b'x'; 2048]));
+    out.insert("big_write".into(), outcome(&big));
+    out.insert(
+        "rename".into(),
+        outcome(&fs::rename(ws, "seed.txt", "moved.txt")),
+    );
+    out.insert("remove".into(), outcome(&fs::remove_file(ws, "other.txt")));
+    let read = fs::open_file(ws, "seed.txt", read_only()).and_then(|f| f.read_to_string(64));
+    out.insert("read".into(), json!(read.unwrap_or_else(|e| e.message)));
+    out
+}
+
+/// The policy capability: the snapshot, budget claims, a grant request and an audit event.
+fn probe_policy() -> Map<String, Value> {
+    let mut out = Map::new();
+    match policy::describe() {
+        Ok(snapshot) => {
+            let budgets: Map<String, Value> = snapshot
+                .budgets
+                .iter()
+                .map(|b| (format!("{:?}", b.kind).to_lowercase(), json!(b.limit)))
+                .collect();
+            out.insert("budgets".into(), Value::Object(budgets));
+            out.insert(
+                "read_only".into(),
+                json!(snapshot.workspaces.iter().any(|w| w.read_only)),
+            );
+            out.insert(
+                "commands".into(),
+                json!(
+                    snapshot
+                        .commands
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>()
+                ),
+            );
+            out.insert(
+                "browser_hosts".into(),
+                json!(
+                    snapshot
+                        .browser
+                        .map(|b| b.allowed_hosts)
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        Err(e) => {
+            out.insert("describe".into(), json!(format!("refused: {}", e.message)));
+        }
+    }
+    let claimed = policy::claim_budget(BudgetKind::FilesystemOps, 3);
+    out.insert(
+        "claim_small".into(),
+        match claimed {
+            Ok(b) => json!(b.used),
+            Err(e) => json!(format!("refused: {}", e.message)),
+        },
+    );
+    out.insert(
+        "claim_huge".into(),
+        outcome(&policy::claim_budget(BudgetKind::Processes, 1_000_000)),
+    );
+    let grant = policy::request_capability(&GrantRequest {
+        capability: "proc.spawn".into(),
+        scope: Some("rm".into()),
+        justification: "probe".into(),
+    });
+    out.insert(
+        "grant".into(),
+        match grant {
+            Ok(g) => json!(g.approved),
+            Err(e) => json!(format!("refused: {}", e.message)),
+        },
+    );
+    let logged = policy::log_event(&AuditEvent {
+        event_type: "probe".into(),
+        step: Some(0),
+        payload: "{}".into(),
+    });
+    out.insert("log_event".into(), outcome(&logged));
+    out
+}
+
+/// The WIT browser interface against the host's allowlist.
+fn probe_browser(task: &Value) -> Map<String, Value> {
+    let url = |key: &str| task[key].as_str().unwrap_or_default().to_string();
+    let mut out = Map::new();
+    let options = SessionOptions {
+        profile: None,
+        headless: true,
+        allow_downloads: false,
+    };
+    let session = match browser::open_session(&options) {
+        Ok(s) => s,
+        Err(e) => {
+            out.insert("open".into(), json!(format!("refused: {}", e.message)));
+            return out;
+        }
+    };
+    out.insert("open".into(), json!("allowed"));
+    let visited = session.goto(&url("allowed"), Some(0));
+    out.insert(
+        "goto_allowed".into(),
+        json!(
+            visited
+                .map(|p| p.url)
+                .unwrap_or_else(|e| format!("refused: {}", e.message))
+        ),
+    );
+    let page = session.describe_page(false);
+    out.insert(
+        "title".into(),
+        json!(page.ok().and_then(|p| p.title).unwrap_or_default()),
+    );
+    out.insert(
+        "goto_off_list".into(),
+        outcome(&session.goto(&url("denied"), Some(0))),
+    );
+    out.insert(
+        "goto_file".into(),
+        outcome(&session.goto("file:///etc/passwd", Some(0))),
+    );
+    let selector = Selector {
+        kind: SelectorKind::Css,
+        value: "#greeting".into(),
+    };
+    let text = session.find(&selector, Some(0)).and_then(|el| {
+        el.click()?;
+        el.inner_text()
+    });
+    out.insert(
+        "element_text".into(),
+        json!(text.unwrap_or_else(|e| format!("refused: {}", e.message))),
+    );
+    session.close();
+    out
+}
+
 fn probe(task: &str, ws: &DirHandle) -> Map<String, Value> {
     let task: Value = serde_json::from_str(task).unwrap_or_default();
+    match task["mode"].as_str().unwrap_or("rules") {
+        "write_ops" => return probe_writes(ws),
+        "policy" => return probe_policy(),
+        "browser" => return probe_browser(&task),
+        "input" => {
+            let mut out = Map::new();
+            out.insert("key_sequence".into(), outcome(&input::key_sequence("x")));
+            return out;
+        }
+        "burn" => {
+            // Loops until the host interrupts it.
+            let mut n: u64 = 0;
+            loop {
+                n = std::hint::black_box(n.wrapping_add(1));
+            }
+        }
+        _ => {}
+    }
     let program = |key: &str| task[key].as_str().unwrap_or_default().to_string();
     let mut out = Map::new();
 
