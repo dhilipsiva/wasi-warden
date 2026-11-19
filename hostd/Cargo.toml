@@ -23,7 +23,7 @@ sha2 = "0.11"
 # host never needs (component-model-async, stack switching, GC, threads, wat, the compile cache), each
 # more surface for a guest to reach.
 wasmtime = { version = "49.0.4", default-features = false, features = ["cranelift", "runtime", "component-model", "std", "backtrace", "demangle", "anyhow", "parallel-compilation"] }
-wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2"] }
 ureq = { version = "2.10.0", default-features = false, features = ["tls", "json"] }
 base64 = "0.23"
 # Kill a timed-out process group (sandbox::run_bounded) without unsafe code.
